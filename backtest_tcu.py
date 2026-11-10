@@ -1,15 +1,11 @@
 """Backtest del modelo TCU-PVPC contra facturas reales evaluando simultáneamente 1001 y 600.
 
-Modelos comparados:
-  - sin fee
-  - fee aditivo media (original)
-  - fee aditivo robusto (mediana winsorizada)  <- RECOMENDADO
-  - fee por bloque (EXPERIMENTO, los datos lo rechazan)
-
-Walk-forward con ventana móvil y ancla a media móvil 3m del precio real.
+Modelo de producción: fee aditivo robusto (mediana winsorizada).
+Modelo comparativo (experimento): fee por bloque (los datos lo rechazan).
+Walk-forward: ventana móvil de 6 meses, fee mediana, sin ancla.
 
 Uso:
-    python backtest_tcu.py facturas.csv [--train-hasta AAAA-MM] [--ventana 6] [--alpha 0.5]
+    python backtest_tcu.py facturas.csv [--train-hasta AAAA-MM] [--ventana 6] [--fee-fijo 0.0052]
 """
 import os, sys, csv, calendar, datetime as dt
 
@@ -88,8 +84,8 @@ def evaluar_indicador(nombre, id_esios, facturas, datos_indicador, pvpc_referenc
     fee_bloques = m.calibrar_fee_por_bloque(train_k)
 
     salida(f"\nFees calibrados con {len(train_k)} meses:")
-    salida(f"  aditivo media   : {fee_media:+.5f} €/kWh")
-    salida(f"  aditivo mediana : {fee_mediana:+.5f} €/kWh  <- RECOMENDADO")
+    salida(f"  aditivo media   : {fee_media:+.5f} €/kWh  (comparativo)")
+    salida(f"  aditivo mediana : {fee_mediana:+.5f} €/kWh  <- PRODUCCIÓN")
     salida(f"  por bloque (exp): " + ", ".join(f"{b}: {v:+.5f}" for b, v in fee_bloques.items()))
 
     salida("\nMes      | real    | sin fee | +fee media | +fee mediana | +fee bloques | desv. media | desv. mediana")
@@ -114,16 +110,13 @@ def evaluar_indicador(nombre, id_esios, facturas, datos_indicador, pvpc_referenc
                f"({r['sesgo_pct']:+.2f} %) | desv. típica {r['desv_tipica']:.5f}")
         return r
 
-    resultados = {}
     for etiqueta, conjunto in (("ENTRENAMIENTO", train), ("PRUEBA (fuera de muestra)", test)):
         if conjunto:
             salida(f"\n{etiqueta} ({nombre}): {len(conjunto)} meses")
-            resultados[etiqueta] = {
-                "sin_fee": mostrar("sin fee", conjunto, 0.0),
-                "media": mostrar(f"fee media {fee_media:+.5f}", conjunto, fee_media),
-                "mediana": mostrar(f"fee mediana {fee_mediana:+.5f}", conjunto, fee_mediana),
-                "bloques": mostrar("fee por bloque (exp)", conjunto, fee_bloques),
-            }
+            mostrar("sin fee", conjunto, 0.0)
+            mostrar(f"fee media {fee_media:+.5f}", conjunto, fee_media)
+            mostrar(f"fee mediana {fee_mediana:+.5f}", conjunto, fee_mediana)
+            mostrar("fee por bloque (exp)", conjunto, fee_bloques)
 
     evaluados = test if test else [x for x in meses if x["kwh_p"]]
     r_sin = m.metricas(evaluados, 0.0)
@@ -153,15 +146,12 @@ def evaluar_indicador(nombre, id_esios, facturas, datos_indicador, pvpc_referenc
             "mejor": mejor, "incluye": incluye}
 
 
-def walk_forward(facturas, datos_indicador, incluye, min_train=6, ventana=6, alpha=0.5):
-    """Walk-forward con ventana móvil y ancla a media móvil 3m del precio real.
+def walk_forward(facturas, datos_indicador, incluye, min_train=6, ventana=6):
+    """Walk-forward con ventana móvil. Fee = mediana robusta. Sin ancla.
 
     Para cada mes t:
       - Entrena con los últimos `ventana` meses con datos completos (excluye 2026-04).
-      - Fee = mediana robusta de residuales en esa ventana.
-      - pred_modelo = precio_modelo_sin_fee(t) + fee
-      - ancla = media móvil 3m del precio_real (meses con kwh_p)
-      - pred = alpha * pred_modelo + (1 - alpha) * ancla
+      - pred = precio_modelo_sin_fee(t) + fee_mediana(train)
     """
     meses = []
     for f in facturas:
@@ -179,19 +169,15 @@ def walk_forward(facturas, datos_indicador, incluye, min_train=6, ventana=6, alp
         if len(train) < 3:
             continue
         test = meses[t]
-        fee = m.calibrar_fee_robusto(train)
-        pred_modelo = test["precio_modelo_sin_fee"] + fee
-        previos = [x["precio_real"] for x in meses[max(0, t - 3):t] if x["kwh_p"]]
-        ancla = sum(previos) / len(previos) if previos else pred_modelo
-        pred_ancla = alpha * pred_modelo + (1 - alpha) * ancla
+        fee_media = m.calibrar_fee(train)
+        fee_mediana = m.calibrar_fee_robusto(train)
+        pred_media = test["precio_modelo_sin_fee"] + fee_media
+        pred_mediana = test["precio_modelo_sin_fee"] + fee_mediana
         resultados.append({
             "mes": test["mes"], "real": test["precio_real"],
-            "pred_media": test["precio_modelo_sin_fee"] + m.calibrar_fee(train),
-            "pred_mediana": pred_modelo,
-            "pred_ancla": pred_ancla,
-            "pct_media": 100 * ((test["precio_modelo_sin_fee"] + m.calibrar_fee(train)) / test["precio_real"] - 1),
-            "pct_mediana": 100 * (pred_modelo / test["precio_real"] - 1),
-            "pct_ancla": 100 * (pred_ancla / test["precio_real"] - 1),
+            "pred_media": pred_media, "pred_mediana": pred_mediana,
+            "pct_media": 100 * (pred_media / test["precio_real"] - 1),
+            "pct_mediana": 100 * (pred_mediana / test["precio_real"] - 1),
         })
     return resultados
 
@@ -202,13 +188,11 @@ def reporte_walk_forward(resultados, nombre):
         print(f"\nWALK-FORWARD {nombre}: sin meses suficientes")
         return
     print(f"\nWALK-FORWARD {nombre}: {len(resultados)} meses out-of-sample")
-    print("Mes      | real    | fee media | fee mediana | fee+ancla(α) | desv media | desv mediana | desv ancla")
+    print("Mes      | real    | fee media | fee mediana | desv media | desv mediana")
     for r in resultados:
         print(f"{r['mes']} | {r['real']:.4f} |  {r['pred_media']:.4f}   |   {r['pred_mediana']:.4f}    |"
-              f"   {r['pred_ancla']:.4f}     | {r['pct_media']:+6.1f} % |  {r['pct_mediana']:+6.1f} %  | {r['pct_ancla']:+6.1f} %")
-    for clave, nom in (("pct_media", "fee media      "),
-                       ("pct_mediana", "fee mediana    "),
-                       ("pct_ancla", "fee mediana+ancla")):
+              f" {r['pct_media']:+6.1f} % |  {r['pct_mediana']:+6.1f} %")
+    for clave, nom in (("pct_media", "fee media  "), ("pct_mediana", "fee mediana")):
         pcts = [r[clave] for r in resultados]
         print(f"  {nom} -> MAPE {st.mean(abs(p) for p in pcts):5.2f} % | "
               f"sesgo {st.mean(pcts):+6.2f} % | peor {max(abs(p) for p in pcts):5.1f} %")
@@ -222,7 +206,6 @@ def main(argv):
     train_hasta = argv[argv.index("--train-hasta") + 1] if "--train-hasta" in argv else None
     fee_fijo = float(argv[argv.index("--fee-fijo") + 1]) if "--fee-fijo" in argv else 0.0052
     ventana = int(argv[argv.index("--ventana") + 1]) if "--ventana" in argv else 6
-    alpha = float(argv[argv.index("--alpha") + 1]) if "--alpha" in argv else 0.5
 
     facturas = leer_facturas(argv[1])
 
@@ -240,13 +223,13 @@ def main(argv):
     evaluar_indicador(
         nombre="TCU PVPC", id_esios=1001, facturas=facturas,
         datos_indicador=pvpc_data, pvpc_referencia=pvpc_data,
-        incluye=None, train_hasta=train_hasta, fee_fijo=fee_fijo)
+        incluye=False, train_hasta=train_hasta, fee_fijo=fee_fijo)
 
     print(f"\n{'='*70}")
-    print(f" WALK-FORWARD (ventana={ventana}m, alpha={alpha}, 2026-04 fuera del train)")
+    print(f" WALK-FORWARD (ventana={ventana}m, fee mediana, sin ancla, 2026-04 fuera del train)")
     print(f"{'='*70}")
     for nombre, datos, incluye in (("SPOT", spot_data, False), ("PVPC", pvpc_data, False)):
-        wf = walk_forward(facturas, datos, incluye, ventana=ventana, alpha=alpha)
+        wf = walk_forward(facturas, datos, incluye, ventana=ventana)
         reporte_walk_forward(wf, nombre)
 
     return 0
