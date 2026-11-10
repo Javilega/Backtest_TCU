@@ -1,148 +1,70 @@
-"""Estimación del coste de la energía 3.0TD con imputación de datos faltantes."""
+"""Estimación del TEV (Término de Energía Variable) 3.0TD."""
 from dotenv import load_dotenv
 load_dotenv()
 import statistics, datetime as dt
 import umbrales as u
 
-PERDIDAS_20TD = {1: 0.167, 2: 0.163, 3: 0.180}
-PERDIDAS_30TD_OFICIALES = {1: 0.166, 2: 0.175, 3: 0.165, 4: 0.165, 5: 0.138, 6: 0.180}
-PEAJES = u.PEAJES_30TD
-CARGOS = u.CARGOS_30TD
+# Coeficientes de pérdidas 3.0TD (Circular 3/2020, NO Circular 7/2020)
+PERDIDAS_30TD = {1: 0.166, 2: 0.175, 3: 0.165, 4: 0.165, 5: 0.138, 6: 0.180}
 
-def periodo_20td(hora_local):
-    dia = hora_local.date()
-    if dia.weekday() >= 5 or dia in u.FESTIVOS_ES:
-        return 3
-    h = hora_local.hour
-    if h < 8:
-        return 3
-    if 10 <= h < 14 or 18 <= h < 22:
-        return 1
-    return 2
 
-def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee=0.0, mes_calendario=None,
-                     perdidas_20td=None, perdidas_30td=None, solo_energia=False):
-    perdidas_20td = perdidas_20td or PERDIDAS_20TD
-    perdidas_30td = perdidas_30td or PERDIDAS_30TD_OFICIALES
+def precio_hora_30td_energia(t_utc, pool_price, mes_calendario=None):
+    """Precio de energía de una hora: pool × (1 + pérdidas_p).
+
+    SPOT 600 NO incluye pérdidas. Se aplican SIEMPRE multiplicando.
+    Devuelve (precio_energia, periodo_3td).
+    """
     local = t_utc.astimezone(u.TZ)
     mes = mes_calendario or local.month
     p3 = u.periodo_3td(local, mes)
-    energia = tcu
-    if incluye_perdidas:
-        energia = energia / (1 + perdidas_20td[periodo_20td(local)])
-    energia = energia * (1 + perdidas_30td[p3])
-    
-    if isinstance(fee, dict):
-        energia = energia * (1 + fee.get("P1P2" if p3 in (1,2) else ("P3P4" if p3 in (3,4) else "P5P6"), 0.0))
-    else:
-        energia = energia + fee
+    return pool_price * (1 + PERDIDAS_30TD[p3]), p3
 
-    if solo_energia:
-        return energia, p3
-        
-    return energia + PEAJES[p3] + CARGOS[p3], p3
 
-def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodos=None,
-                           pesos=None, mes_calendario=None, solo_energia=False, historico=None):
+def tev_base_ponderado(pool_data, ini, fin, kwh_periodos, mes_calendario):
+    """TEV base (€/kWh) ponderado por kWh reales o previstos por periodo.
+
+    Args:
+        pool_data: lista de (datetime_utc, precio_pool) del SPOT 600.
+        ini, fin: datetime naive/aware que delimitan el mes.
+        kwh_periodos: dict {periodo: kwh} del mes (reales o previstos).
+        mes_calendario: mes (1-12) para asignar periodos 3.0TD.
+
+    Returns:
+        TEV base en €/kWh (precio del pool × pérdidas, ponderado).
+    """
     horas = {p: [] for p in range(1, 7)}
-    for t, v in tcu:
+    for t, v in pool_data:
         if ini <= t < fin:
-            precio, p = precio_hora_30td(t, v, incluye_perdidas, fee, mes_calendario, solo_energia=solo_energia)
+            precio, p = precio_hora_30td_energia(t, v, mes_calendario)
             horas[p].append(precio)
-    
-    if kwh_periodos:
-        pesos_p = {p: k for p, k in kwh_periodos.items() if k > 0}
-        nivel = "kWh facturados"
-    else:
-        pesos_p = {p: w for p, w in (pesos or {}).items() if w > 0}
-        nivel = "pesos estacionales"
-    
-    if not pesos_p:
-        raise ValueError("Faltan kWh por periodo o pesos para ponderar")
-        
+
+    pesos = {p: k for p, k in kwh_periodos.items() if k > 0}
+    if not pesos:
+        raise ValueError("Sin kWh por periodo para ponderar TEV")
+
     total = suma = 0.0
-    detalle = {}
-    periodos_ignorados = []
-    
-    for p, w in pesos_p.items():
+    for p, w in pesos.items():
         if len(horas[p]) < 24:
-            # IMPUTACIÓN: Buscar en el histórico los últimos 3 meses con datos para este periodo
-            imputado = False
-            if historico:
-                for mes_ant in reversed(historico[-3:]):
-                    if p in mes_ant["detalle"] and mes_ant["detalle"][p][0] >= 24:
-                        media_imputada = mes_ant["detalle"][p][1]
-                        detalle[p] = (0, media_imputada, w) # 0 horas, pero usamos la media imputada
-                        total += w * media_imputada
-                        suma += w
-                        imputado = True
-                        break
-            if not imputado:
-                periodos_ignorados.append((p, len(horas[p])))
-                continue
-        else:
-            media = sum(horas[p]) / len(horas[p])
-            detalle[p] = (len(horas[p]), media, w)
-            total += w * media
-            suma += w
-            
-    if suma == 0:
-        raise ValueError(f"No hay datos válidos para ningún periodo.")
-        
-    if periodos_ignorados:
-        print(f"AVISO: Periodos ignorados sin histórico para imputar: {periodos_ignorados}")
+            raise ValueError(f"Faltan horas del periodo P{p} para TEV ({len(horas[p])})")
+        media = sum(horas[p]) / len(horas[p])
+        total += w * media
+        suma += w
+    return total / suma
 
-    return total / suma, detalle, nivel
 
-def _pendiente_theilsen(x, y):
+def calibrar_fee_tev(meses_train, winsor=0.10):
+    """Fee aditivo robusto sobre TEV: mediana winsorizada de residuales.
+
+    Args:
+        meses_train: lista de dicts con 'tev_real' y 'tev_base'.
+        winsor: fracción de winsorización (0.10 = 10% por cola).
+
+    Returns:
+        Fee en €/kWh.
+    """
     import numpy as np
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    n = len(x)
-    if n < 2:
-        return None
-    pend = []
-    for i in range(n - 1):
-        dx = x[i + 1:] - x[i]
-        dy = y[i + 1:] - y[i]
-        mask = np.abs(dx) > 1e-9
-        pend.extend((dy[mask] / dx[mask]).tolist())
-    return float(np.median(pend)) if pend else None
-
-def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
-    pv = dict(pvpc_1001)
-    por_periodo = {1: ([], []), 2: ([], []), 3: ([], [])}
-    for t, v in tcu:
-        if t in pv:
-            p2 = periodo_20td(t.astimezone(u.TZ))
-            por_periodo[p2][0].append(v)
-            por_periodo[p2][1].append(pv[t])
-    pendientes = {}
-    for p, (x, y) in por_periodo.items():
-        if len(x) >= min_horas:
-            s = _pendiente_theilsen(x, y)
-            if s is not None:
-                pendientes[p] = s
-    if len(pendientes) < 2:
-        return "PENDIENTE", pendientes
-    votos_incluye = sum(abs(s - 1.0) <= tolerancia for s in pendientes.values())
-    votos_no = sum(abs(s - (1 + PERDIDAS_20TD[p])) <= tolerancia for p, s in pendientes.items())
-    if votos_incluye > votos_no:
-        return "INCLUYE_PERDIDAS", pendientes
-    if votos_no > votos_incluye:
-        return "NO_INCLUYE_PERDIDAS", pendientes
-    return "AMBIGUO", pendientes
-
-def calibrar_fee(meses):
-    base = sum(m["kwh"] for m in meses)
-    if base <= 0:
-        raise ValueError("Sin kWh para ponderar la calibración")
-    return sum(m["kwh"] * (m["coste_energia_real"] - m["precio_modelo_sin_fee"]) for m in meses) / base
-
-def calibrar_fee_robusto(meses, winsor=0.10):
-    import numpy as np
-    res = [m["coste_energia_real"] - m["precio_modelo_sin_fee"] for m in meses
-           if m.get("kwh", 0) > 0 and m.get("precio_modelo_sin_fee", 0) > 0]
+    res = [m["tev_real"] - m["tev_base"] for m in meses_train
+           if m.get("tev_real") and m.get("tev_base", 0) > 0]
     if not res:
         return 0.0
     res = np.array(res, dtype=float)
@@ -151,8 +73,10 @@ def calibrar_fee_robusto(meses, winsor=0.10):
         res = np.clip(res, lo, hi)
     return float(np.median(res))
 
-def metricas(meses, fee, columna_real="coste_energia_real"):
-    est = [m["precio_modelo_sin_fee"] + fee for m in meses]
+
+def metricas_tev(meses, fee, columna_real="tev_real"):
+    """Métricas de error del TEV con un fee dado."""
+    est = [m["tev_base"] + fee for m in meses]
     real = [m[columna_real] for m in meses]
     kwh = [m.get("kwh") or 0 for m in meses]
     err = [e - r for e, r in zip(est, real)]
@@ -163,7 +87,7 @@ def metricas(meses, fee, columna_real="coste_energia_real"):
         "mape": statistics.mean(abs(p) for p in pct),
         "sesgo": (sum(w * e for w, e in zip(kwh, err)) / k) if k else statistics.mean(err),
         "sesgo_pct": statistics.mean(pct),
-        "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
+        "peor_mes": max(abs(p) for p in pct),
+        "n_meses": len(meses),
         "por_mes_pct": pct,
-        "error_euros": [e * w for e, w in zip(err, kwh)],
     }
