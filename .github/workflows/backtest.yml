@@ -28,4 +28,5 @@ jobs:
         ESIOS_TOKEN: ${{ secrets.ESIOS_TOKEN }}
         DESCUENTO: ${{ vars.DESCUENTO }}
       run: |
-        python backtest_tcu.py facturas_actualizadas.csv --train-hasta 2026-03 --ventana 6
+       python backtest_tcu.py facturas_desglosadas.csv --train-hasta 2026-03 --ventana 6
+      
