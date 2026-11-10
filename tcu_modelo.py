@@ -50,7 +50,8 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
             precio, p = precio_hora_30td(t, v, incluye_perdidas, fee, mes_calendario, solo_energia=solo_energia)
             horas[p].append(precio)
     
-    # CLAVE: Si tenemos kwh_periodos, solo procesamos los periodos con consumo > 0
+    # ESTO ES LO ESTRICTO: Si el periodo tiene consumo, EXIGIMOS que haya al menos 24 horas de datos.
+    # Si no hay, lanzamos error para que nos enteremos de que ESIOS falló.
     if kwh_periodos:
         pesos_p = {p: k for p, k in kwh_periodos.items() if k > 0}
         nivel = "kWh facturados"
@@ -64,7 +65,6 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
     total = suma = 0.0
     detalle = {}
     for p, w in pesos_p.items():
-        # Si el periodo tiene consumo, comprobamos que haya precios
         if len(horas[p]) < 24:
             raise ValueError(f"Faltan precios del periodo P{p} ({len(horas[p])} horas)")
         media = sum(horas[p]) / len(horas[p])
