@@ -5,12 +5,6 @@ import tcu_modelo as m
 from dotenv import load_dotenv
 load_dotenv()
 
-# Estimación del Término de Potencia e Impuestos para la comparación justa
-# (Basado en tus facturas: Potencia ~48kW, Impuesto Eléctrico 5.11%, IVA 21%)
-POTENCIA_ESTIMADA_EUR_KWH = 0.025  # Aproximación media
-IMPUESTO_ELECTRICO = 0.0511
-IVA = 0.21
-
 def leer_facturas(ruta):
     filas = []
     try:
@@ -81,7 +75,6 @@ def evaluar_indicador(nombre, datos_indicador, pvpc_referencia, facturas, incluy
         if f["coste_energia_real"] is None: continue
         ini, fin, mes = limites_mes(f["mes"])
         
-        # Pasamos el histórico para imputar periodos faltantes
         precio, detalle, _ = m.precio_medio_ponderado(
             datos_indicador, ini, fin, incluye, 0.0, kwh_periodos=f["kwh_p"],
             mes_calendario=mes, solo_energia=True, historico=historico)
@@ -92,7 +85,7 @@ def evaluar_indicador(nombre, datos_indicador, pvpc_referencia, facturas, incluy
     train = [x for x in meses if train_hasta is None or x["mes"] <= train_hasta]
     test = [x for x in meses if train_hasta is not None and x["mes"] > train_hasta]
     
-    # Fee adaptativo: usamos una ventana móvil de 3 meses para el fee
+    # Fee adaptativo con ventana móvil de 3 meses
     fee_mediana = 0.0
     if train:
         ventana_train = train[-3:] if len(train) >= 3 else train
@@ -100,19 +93,20 @@ def evaluar_indicador(nombre, datos_indicador, pvpc_referencia, facturas, incluy
 
     salida(f"\nFee calibrado (ventana móvil 3m): {fee_mediana:+.5f}")
 
-    salida("\nMes      | TEV real | TEV modelo | +fee | Error TEV % | Final Estimado | Error Final %")
+    salida("\nMes      | TEV real | TEV modelo | +fee | Error TEV % | Precio Final Predicho | Error Final %")
     for x in meses:
         est_tev = x["precio_modelo_sin_fee"] + fee_mediana
         err_tev_pct = 100 * (est_tev / x["coste_energia_real"] - 1)
         
-        # Precio Final Estimado (incluye Potencia + Impuestos)
-        pred_final_sin_iva = est_tev + x["peajes_cargos_real"] + POTENCIA_ESTIMADA_EUR_KWH
-        pred_final_con_iva = pred_final_sin_iva * (1 + IMPUESTO_ELECTRICO) * (1 + IVA)
+        # LA CLAVE: El "fijo" (Potencia + Impuestos) es la diferencia entre el precio original y (TEV_real + TETA_real)
+        fijo_real = x["precio_real_original"] - x["coste_energia_real"] - x["peajes_cargos_real"]
         
-        err_final_pct = 100 * (pred_final_con_iva / x["precio_real_original"] - 1) if x["precio_real_original"] else 0.0
+        # Predicción final = TEV_predicho + TETA_real + Fijo_real
+        pred_final = est_tev + x["peajes_cargos_real"] + fijo_real
+        err_final_pct = 100 * (pred_final / x["precio_real_original"] - 1) if x["precio_real_original"] else 0.0
         
         etiqueta = "train" if x in train else "TEST"
-        salida(f"{x['mes']} |  {x['coste_energia_real']:.4f}  |   {x['precio_modelo_sin_fee']:.4f}   | {est_tev:.4f} |   {err_tev_pct:+5.1f} %   |     {pred_final_con_iva:.4f}     |   {err_final_pct:+5.1f} % [{etiqueta}]")
+        salida(f"{x['mes']} |  {x['coste_energia_real']:.4f}  |   {x['precio_modelo_sin_fee']:.4f}   | {est_tev:.4f} |   {err_tev_pct:+5.1f} %   |        {pred_final:.4f}        |   {err_final_pct:+5.1f} % [{etiqueta}]")
 
     def mostrar(nom, conjunto, fee):
         if not conjunto: return
