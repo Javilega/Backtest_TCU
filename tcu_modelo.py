@@ -1,13 +1,5 @@
 """Estimación del precio medio de la energía 3.0TD indexada (€/kWh, sin IVA ni impuesto eléctrico)
 a partir del TCU del PVPC (coste de producción de la energía) publicado en ESIOS.
-
-Precio horario:
-    energía(h) = TCU(h) / (1 + pérdidas_2.0TD(h))   <- solo si el TCU YA incluye pérdidas
-    energía(h) = energía(h) * (1 + pérdidas_3.0TD(p))
-    P(h)       = energía(h) * (1 + fee_bloque) + peaje(p) + cargo(p)   <- fee multiplicativo
-    P(h)       = energía(h) + peaje(p) + cargo(p) + fee               <- fee aditivo (retrocompatible)
-
-El fee puede ser float (aditivo) o dict {P1P2, P3P4, P5P6} (multiplicativo por bloque).
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,7 +17,6 @@ _BLOQUES = ("P1P2", "P3P4", "P5P6")
 
 
 def _bloque_de_periodo(p3):
-    """Agrupa P1-P6 en 3 bloques: P1P2, P3P4, P5P6."""
     return "P1P2" if p3 in (1, 2) else ("P3P4" if p3 in (3, 4) else "P5P6")
 
 
@@ -43,11 +34,6 @@ def periodo_20td(hora_local):
 
 def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee, mes_calendario=None,
                      perdidas_20td=None, perdidas_30td=None):
-    """Precio de la energía 3.0TD de una hora (€/kWh).
-
-    fee: float (aditivo, retrocompatible) o dict {P1P2, P3P4, P5P6} (multiplicativo).
-    Devuelve (precio, periodo 3.0TD).
-    """
     perdidas_20td = perdidas_20td or PERDIDAS_20TD
     perdidas_30td = perdidas_30td or PERDIDAS_30TD_OFICIALES
     local = t_utc.astimezone(u.TZ)
@@ -67,7 +53,6 @@ def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee, mes_calendario=None,
 
 def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodos=None,
                            pesos=None, mes_calendario=None):
-    """Precio medio ponderado (€/kWh) en [ini, fin)."""
     horas = {p: [] for p in range(1, 7)}
     for t, v in tcu:
         if ini <= t < fin:
@@ -92,7 +77,6 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
 
 
 def _pendiente_theilsen(x, y):
-    """Mediana de pendientes por pares (Theil-Sen), robusta a outliers. Sin sklearn."""
     import numpy as np
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -109,7 +93,6 @@ def _pendiente_theilsen(x, y):
 
 
 def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
-    """Diagnóstico robusto: Theil-Sen por periodo + votación por mayoría."""
     pv = dict(pvpc_1001)
     por_periodo = {1: ([], []), 2: ([], []), 3: ([], [])}
     for t, v in tcu:
@@ -117,21 +100,17 @@ def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
             p2 = periodo_20td(t.astimezone(u.TZ))
             por_periodo[p2][0].append(v)
             por_periodo[p2][1].append(pv[t])
-
     pendientes = {}
     for p, (x, y) in por_periodo.items():
         if len(x) >= min_horas:
             s = _pendiente_theilsen(x, y)
             if s is not None:
                 pendientes[p] = s
-
     if len(pendientes) < 2:
         return "PENDIENTE: datos insuficientes", pendientes
-
     votos_incluye = sum(abs(s - 1.0) <= tolerancia for s in pendientes.values())
     votos_no = sum(abs(s - (1 + PERDIDAS_20TD[p])) <= tolerancia
                    for p, s in pendientes.items())
-
     if votos_incluye > votos_no:
         return "INCLUYE_PERDIDAS", pendientes
     if votos_no > votos_incluye:
@@ -140,20 +119,19 @@ def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
 
 
 def calibrar_fee(meses):
-    """Fee aditivo ponderado por kWh (retrocompatible, sin cambios)."""
     base = sum(m["kwh"] for m in meses)
     if base <= 0:
         raise ValueError("Sin kWh para ponderar la calibración")
     return sum(m["kwh"] * (m["precio_real"] - m["precio_modelo_sin_fee"]) for m in meses) / base
 
 
-def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-4):
-    """Fee multiplicativo por bloque {P1P2, P3P4, P5P6}, sin sklearn.
+def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-1):
+    """Fee multiplicativo por bloque con regularización fuerte.
 
-    Regresión lineal con clipping de outliers (winsor) y regularización ridge mínima.
+    Con 11-16 meses, ridge=1e-1 fuerza coeficientes cercanos a 0 (degenera al aditivo).
+    Se conserva como experimento comparativo; los datos rechazan el fee por bloque.
     """
     import numpy as np
-
     filas = []
     for m in meses:
         if not m.get("kwh_p") or m["precio_modelo_sin_fee"] <= 0:
@@ -166,16 +144,12 @@ def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-4):
         for p, k in m["kwh_p"].items():
             w[_bloque_de_periodo(int(p))] += k / tot
         filas.append(([w[b] for b in _BLOQUES], r))
-
     if len(filas) < 3:
         return {b: 0.0 for b in _BLOQUES}
-
     X = np.array([f[0] for f in filas])
     y = np.array([f[1] for f in filas])
-
     lo, hi = np.quantile(y, [winsor, 1 - winsor])
     y = np.clip(y, lo, hi)
-
     A = X.T @ X + ridge * np.eye(len(_BLOQUES))
     b = X.T @ y
     coef = np.linalg.solve(A, b)
@@ -183,7 +157,6 @@ def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-4):
 
 
 def metricas(meses, fee):
-    """Métricas con fee float (aditivo) o dict (multiplicativo por bloque)."""
     if isinstance(fee, dict):
         est = []
         for m in meses:
@@ -213,4 +186,4 @@ def metricas(meses, fee):
         "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
         "por_mes_pct": pct,
         "error_euros": [e * w for e, w in zip(err, kwh)],
-    }
+        }
