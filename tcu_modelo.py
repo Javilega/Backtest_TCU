@@ -23,14 +23,10 @@ def precio_hora_30td_energia(t_utc, pool_price, mes_calendario=None):
 def tev_base_ponderado(pool_data, ini, fin, kwh_periodos, mes_calendario):
     """TEV base (€/kWh) ponderado por kWh reales o previstos por periodo.
 
-    Args:
-        pool_data: lista de (datetime_utc, precio_pool) del SPOT 600.
-        ini, fin: datetime naive/aware que delimitan el mes.
-        kwh_periodos: dict {periodo: kwh} del mes (reales o previstos).
-        mes_calendario: mes (1-12) para asignar periodos 3.0TD.
+    TOLERANTE A HUECOS: si un periodo no tiene al menos 24 horas de datos
+    (ESIOS a veces devuelve 0), se ignora y se repondera con los que sí.
 
-    Returns:
-        TEV base en €/kWh (precio del pool × pérdidas, ponderado).
+    Devuelve (tev_base, info_imputacion).
     """
     horas = {p: [] for p in range(1, 7)}
     for t, v in pool_data:
@@ -43,25 +39,24 @@ def tev_base_ponderado(pool_data, ini, fin, kwh_periodos, mes_calendario):
         raise ValueError("Sin kWh por periodo para ponderar TEV")
 
     total = suma = 0.0
+    ignorados = []
     for p, w in pesos.items():
         if len(horas[p]) < 24:
-            raise ValueError(f"Faltan horas del periodo P{p} para TEV ({len(horas[p])})")
+            ignorados.append((p, len(horas[p])))
+            continue
         media = sum(horas[p]) / len(horas[p])
         total += w * media
         suma += w
-    return total / suma
+
+    if suma == 0:
+        raise ValueError(f"Ningún periodo con horas suficientes. Ignorados: {ignorados}")
+
+    info = {"ignorados": ignorados, "horas_disponibles": {p: len(h) for p, h in horas.items()}}
+    return total / suma, info
 
 
 def calibrar_fee_tev(meses_train, winsor=0.10):
-    """Fee aditivo robusto sobre TEV: mediana winsorizada de residuales.
-
-    Args:
-        meses_train: lista de dicts con 'tev_real' y 'tev_base'.
-        winsor: fracción de winsorización (0.10 = 10% por cola).
-
-    Returns:
-        Fee en €/kWh.
-    """
+    """Fee aditivo robusto sobre TEV: mediana winsorizada de residuales."""
     import numpy as np
     res = [m["tev_real"] - m["tev_base"] for m in meses_train
            if m.get("tev_real") and m.get("tev_base", 0) > 0]
