@@ -6,7 +6,6 @@ import holidays
 TZ = ZoneInfo("Europe/Madrid")
 FESTIVOS_ES = holidays.ES()
 
-
 def _leer_descuento():
     texto = os.environ.get("DESCUENTO", "").strip().replace(",", ".")
     if not texto:
@@ -21,25 +20,17 @@ def _leer_descuento():
         raise ValueError(f"DESCUENTO no válido: {valor}")
     return valor
 
-
 DESCUENTO_FAMILIA_NUMEROSA = _leer_descuento()
 FACTOR_AEROTERMIA = 0.58
 
 PESOS_PERIODOS = {
-    1:  {1: 30.85, 2: 20.59, 6: 48.56},
-    2:  {1: 30.85, 2: 20.59, 6: 48.56},
-    3:  {2: 30.83, 3: 20.57, 6: 48.60},
-    4:  {4: 33.76, 5: 26.67, 6: 39.57},
-    5:  {4: 33.76, 5: 26.67, 6: 39.57},
-    6:  {3: 31.45, 4: 25.66, 6: 42.90},
-    7:  {1: 31.74, 2: 25.70, 6: 42.56},
-    8:  {3: 27.24, 4: 22.32, 6: 50.44},
-    9:  {3: 27.24, 4: 22.32, 6: 50.44},
-    10: {4: 33.80, 5: 26.70, 6: 39.51},
-    11: {2: 30.82, 3: 20.59, 6: 48.59},
-    12: {1: 30.85, 2: 20.59, 6: 48.56},
+    1:  {1: 30.85, 2: 20.59, 6: 48.56}, 2:  {1: 30.85, 2: 20.59, 6: 48.56},
+    3:  {2: 30.83, 3: 20.57, 6: 48.60}, 4:  {4: 33.76, 5: 26.67, 6: 39.57},
+    5:  {4: 33.76, 5: 26.67, 6: 39.57}, 6:  {3: 31.45, 4: 25.66, 6: 42.90},
+    7:  {1: 31.74, 2: 25.70, 6: 42.56}, 8:  {3: 27.24, 4: 22.32, 6: 50.44},
+    9:  {3: 27.24, 4: 22.32, 6: 50.44}, 10: {4: 33.80, 5: 26.70, 6: 39.51},
+    11: {2: 30.82, 3: 20.59, 6: 48.59}, 12: {1: 30.85, 2: 20.59, 6: 48.56},
 }
-
 
 def _leer_ajuste():
     texto = os.environ.get("FACTOR_AJUSTE_30TD", "").strip().replace(",", ".")
@@ -51,13 +42,10 @@ def _leer_ajuste():
         return 1.0
     return valor if 0.3 <= valor <= 1.5 else 1.0
 
-
 FACTOR_AJUSTE_30TD = _leer_ajuste()
-
 PEAJES_30TD = {1: 0.027511, 2: 0.012376, 3: 0.004943, 4: 0.002627, 5: 0.000111, 6: 0.000031}
 CARGOS_30TD = {1: 0.035841, 2: 0.026538, 3: 0.014336, 4: 0.007168, 5: 0.004595, 6: 0.002867}
 PERDIDAS_30TD = {1: 0.166, 2: 0.175, 3: 0.165, 4: 0.165, 5: 0.138, 6: 0.180}
-
 
 def _leer_margen():
     texto = os.environ.get("MARGEN_COMERCIAL", "").strip().replace(",", ".")
@@ -68,16 +56,13 @@ def _leer_margen():
     except ValueError:
         return None
 
-
 MARGEN_COMERCIAL = _leer_margen()
 VERANO_DESDE = (5, 15)
 VERANO_HASTA = (10, 15)
-
 FACTORES_INYECCION_MENSUAL = {
     1: 0.65, 2: 0.65, 3: 0.55, 4: 0.45, 5: 0.40, 6: 0.40,
     7: 0.40, 8: 0.40, 9: 0.40, 10: 0.45, 11: 0.55, 12: 0.65,
 }
-
 
 def _leer_dias():
     try:
@@ -85,24 +70,19 @@ def _leer_dias():
     except ValueError:
         return 30
 
-
 DIAS_MEDIA = _leer_dias()
 DIAS_CACHE = max(35, DIAS_MEDIA + 5)
-
 
 def ahora_utc():
     return dt.datetime.now(dt.timezone.utc)
 
-
 def medianoche(fecha):
     return dt.datetime.combine(fecha, dt.time(0, 0), tzinfo=TZ)
-
 
 SERIES = {
     "pvpc": {"indicador": 1001, "geo": 8741, "cache": os.path.join("datos", "precios.json")},
     "spot": {"indicador": 600, "geo": 3, "cache": os.path.join("datos", "spot.json")},
 }
-
 
 def pedir_esios(ini, fin, serie="pvpc"):
     cfg = SERIES[serie]
@@ -145,7 +125,6 @@ def pedir_esios(ini, fin, serie="pvpc"):
         raise ValueError("ESIOS no devolvió precios")
     return sorted((t, sum(vs) / len(vs)) for t, vs in por_hora.items())
 
-
 def leer_cache(serie="pvpc"):
     try:
         with open(SERIES[serie]["cache"], encoding="utf-8") as f:
@@ -153,7 +132,6 @@ def leer_cache(serie="pvpc"):
         return sorted((dt.datetime.fromisoformat(k), float(v)) for k, v in crudo.items())
     except Exception:
         return []
-
 
 def guardar_cache(datos, serie="pvpc"):
     ruta = SERIES[serie]["cache"]
@@ -166,7 +144,6 @@ def guardar_cache(datos, serie="pvpc"):
         json.dump({"precios": {t.isoformat(): round(p, 6) for t, p in sorted(podado.items())}},
                   f, separators=(",", ":"))
 
-
 def precios(ini, fin, horas_clave, serie="pvpc"):
     guardados = [(t, p) for t, p in leer_cache(serie) if ini <= t < fin]
     esperadas = int((fin - ini).total_seconds() // 3600)
@@ -174,7 +151,6 @@ def precios(ini, fin, horas_clave, serie="pvpc"):
     if all(h in horas for h in horas_clave) and len(guardados) >= 0.9 * esperadas:
         return guardados, "caché"
     return pedir_esios(ini, fin, serie), "ESIOS"
-
 
 def media_de(datos, fecha, dias=None):
     dias = dias or DIAS_MEDIA
@@ -185,7 +161,6 @@ def media_de(datos, fecha, dias=None):
     if len(valores) < minimo:
         raise ValueError(f"Solo hay {len(valores)} precios en los {dias} días previos")
     return sum(valores) / len(valores)
-
 
 def periodo_3td(hora_local, mes):
     dia = hora_local.date()
@@ -203,14 +178,11 @@ def periodo_3td(hora_local, mes):
         return 3 if punta else 4
     return 4 if punta else 5
 
-
 def es_verano(fecha):
     return VERANO_DESDE <= (fecha.month, fecha.day) <= VERANO_HASTA
 
-
 def _hora_local(t):
     return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).astimezone(TZ)
-
 
 def _medias_por_periodo(serie, fecha, dias):
     fin = medianoche(fecha)
@@ -224,7 +196,6 @@ def _medias_por_periodo(serie, fecha, dias):
                 acumulado[p][0] += precio
                 acumulado[p][1] += 1
     return {p: (a[0] / a[1] if a[1] else 0.0, a[1]) for p, a in acumulado.items()}
-
 
 def precio_aerotermia(datos, fecha, dias=None):
     texto = os.environ.get("PRECIO_AEROTERMIA", "").strip().replace(",", ".")
@@ -245,7 +216,6 @@ def precio_aerotermia(datos, fecha, dias=None):
         suma_pesos += peso
     return total / suma_pesos * FACTOR_AJUSTE_30TD
 
-
 def precio_aerotermia_spot(spot, fecha, dias=None, margen=None):
     margen = MARGEN_COMERCIAL if margen is None else margen
     dias = dias or DIAS_MEDIA
@@ -263,9 +233,7 @@ def precio_aerotermia_spot(spot, fecha, dias=None, margen=None):
         suma_pesos += peso
     return total / suma_pesos + margen, detalle
 
-
 Umbrales = collections.namedtuple("Umbrales", "media inyeccion eficiencia factor modo aerotermia metodo")
-
 
 def calcular_umbrales(datos, fecha, dias=None, spot=None):
     media = media_de(datos, fecha, dias)
@@ -284,11 +252,9 @@ def calcular_umbrales(datos, fecha, dias=None, spot=None):
             if os.environ.get("PRECIO_AEROTERMIA", "").strip():
                 metodo = "manual"
         base = aero
-
     eficiencia = base * FACTOR_AEROTERMIA / (1.0 - DESCUENTO_FAMILIA_NUMEROSA)
     factor = FACTORES_INYECCION_MENSUAL[fecha.month]
     return Umbrales(media, eficiencia * factor, eficiencia, factor, modo, aero, metodo)
-
 
 def decidir(precio, umbral_inyeccion, umbral_eficiencia, precio_anterior=None, umbral_anterior=None):
     if precio <= umbral_inyeccion:
