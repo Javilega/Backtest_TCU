@@ -26,6 +26,6 @@ jobs:
     - name: Ejecutar backtest
       env:
         ESIOS_TOKEN: ${{ secrets.ESIOS_TOKEN }}
-        DESCUENTO: ${{ secrets.DESCUENTO }}
+        DESCUENTO: ${{ vars.DESCUENTO }}
       run: |
         python backtest_tcu.py facturas_actualizadas.csv --train-hasta 2026-03
