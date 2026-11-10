@@ -8,6 +8,9 @@ El perfil previsto usa, en este orden:
   1. Perfil real del mismo mes en años anteriores.
   2. Perfil del mes anterior disponible.
   3. Media de los perfiles de los últimos 3 meses disponibles.
+
+Si no hay histórico suficiente, el mes se omite del cálculo de TETA
+(pero sigue en el de TEV, que no depende de perfiles).
 """
 import os, sys, calendar, datetime as dt
 import umbrales as u
@@ -88,24 +91,27 @@ def perfil_consumo_previsto(mes_objetivo, historico):
                  and f["kwh_p"]]
     if mismo_mes:
         total = sum(sum(f["kwh_p"].values()) for f in mismo_mes)
-        return {p: sum(f["kwh_p"].get(p, 0) for f in mismo_mes) / total
-                for p in range(1, 7)
-                if any(f["kwh_p"].get(p, 0) > 0 for f in mismo_mes)}
+        if total > 0:
+            return {p: sum(f["kwh_p"].get(p, 0) for f in mismo_mes) / total
+                    for p in range(1, 7)
+                    if any(f["kwh_p"].get(p, 0) > 0 for f in mismo_mes)}
 
     # 2. Mes anterior
     anteriores = [f for f in historico if f["mes"] < mes_objetivo and f["kwh_p"]]
     if anteriores:
         ultimo = anteriores[-1]
         total = sum(ultimo["kwh_p"].values())
-        return {p: k / total for p, k in ultimo["kwh_p"].items() if k > 0}
+        if total > 0:
+            return {p: k / total for p, k in ultimo["kwh_p"].items() if k > 0}
 
     # 3. Media de últimos 3
     ultimos_3 = anteriores[-3:] if len(anteriores) >= 3 else anteriores
     if ultimos_3:
         total = sum(sum(f["kwh_p"].values()) for f in ultimos_3)
-        return {p: sum(f["kwh_p"].get(p, 0) for f in ultimos_3) / total
-                for p in range(1, 7)
-                if any(f["kwh_p"].get(p, 0) > 0 for f in ultimos_3)}
+        if total > 0:
+            return {p: sum(f["kwh_p"].get(p, 0) for f in ultimos_3) / total
+                    for p in range(1, 7)
+                    if any(f["kwh_p"].get(p, 0) > 0 for f in ultimos_3)}
 
     raise ValueError(f"Sin histórico para predecir perfil de {mes_objetivo}")
 
@@ -119,27 +125,34 @@ def evaluar_operativo(spot_data, facturas, train_hasta):
         if f["tev_real"] is None:
             continue
 
-        # Histórico: solo meses ANTERIORES a f
         historico = facturas[:i]
 
         ini, fin, mes = limites_mes(f["mes"])
         anio = int(f["mes"].split("-")[0])
 
         # TEV base: SPOT × (1+pérdidas), ponderado por kWh REALES
-        # (retrospectivo para evaluar el TEV, pero el TETA será operativo)
-        tev_base = m.tev_base_ponderado(spot_data, ini, fin, f["kwh_p"], mes)
+        try:
+            tev_base = m.tev_base_ponderado(spot_data, ini, fin, f["kwh_p"], mes)
+        except ValueError as e:
+            print(f"AVISO {f['mes']}: no se puede calcular TEV ({e}). Se omite.")
+            continue
 
         # TETA operativo: usa PERFIL PREVISTO, no kWh reales
-        try:
-            pesos_prev = perfil_consumo_previsto(f["mes"], historico)
-            teta_est = teta.teta_estimado(anio, pesos_prev)
-            origen_perfil = "mismo_mes" if any(
-                h["mes"].endswith(f"-{mes:02d}") and int(h["mes"].split("-")[0]) < anio
-                for h in historico) else "fallback"
-        except ValueError as e:
-            print(f"AVISO {f['mes']}: {e}")
+        if not historico:
+            print(f"AVISO {f['mes']}: sin histórico previo. Se omite del cálculo de TETA.")
             teta_est = None
-            origen_perfil = "sin_datos"
+            origen_perfil = "sin_historico"
+        else:
+            try:
+                pesos_prev = perfil_consumo_previsto(f["mes"], historico)
+                teta_est = teta.teta_estimado(anio, pesos_prev)
+                origen_perfil = "mismo_mes" if any(
+                    h["mes"].endswith(f"-{mes:02d}") and int(h["mes"].split("-")[0]) < anio
+                    for h in historico) else "fallback"
+            except ValueError as e:
+                print(f"AVISO {f['mes']}: {e}")
+                teta_est = None
+                origen_perfil = "sin_datos"
 
         meses.append({**f, "tev_base": tev_base, "teta_est": teta_est,
                       "anio": anio, "origen_perfil": origen_perfil})
