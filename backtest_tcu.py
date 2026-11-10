@@ -1,7 +1,15 @@
 """Backtest del modelo TCU-PVPC contra facturas reales evaluando simultáneamente 1001 y 600.
 
+Modelos comparados:
+  - sin fee
+  - fee aditivo media (original)
+  - fee aditivo robusto (mediana winsorizada)  <- RECOMENDADO
+  - fee por bloque (EXPERIMENTO, los datos lo rechazan)
+
+Walk-forward con ventana móvil y ancla a media móvil 3m del precio real.
+
 Uso:
-    python backtest_tcu.py facturas.csv [--train-hasta AAAA-MM] [--fee-fijo 0.0052]
+    python backtest_tcu.py facturas.csv [--train-hasta AAAA-MM] [--ventana 6] [--alpha 0.5]
 """
 import os, sys, csv, calendar, datetime as dt
 
@@ -75,73 +83,85 @@ def evaluar_indicador(nombre, id_esios, facturas, datos_indicador, pvpc_referenc
     test = [x for x in meses if train_hasta is not None and x["mes"] > train_hasta]
     train_k = [x for x in train if x["kwh"] > 0 and x["kwh_p"] and x["mes"] != "2026-04"]
 
-    fee_aditivo = m.calibrar_fee(train_k)
+    fee_media = m.calibrar_fee(train_k)
+    fee_mediana = m.calibrar_fee_robusto(train_k)
     fee_bloques = m.calibrar_fee_por_bloque(train_k)
 
-    salida(f"\nFee aditivo calibrado con {len(train_k)} meses: {fee_aditivo:.5f} €/kWh")
-    salida(f"Fee por bloque (ridge fuerte, comparativo): "
-           + ", ".join(f"{b}: {v:+.5f}" for b, v in fee_bloques.items()))
+    salida(f"\nFees calibrados con {len(train_k)} meses:")
+    salida(f"  aditivo media   : {fee_media:+.5f} €/kWh")
+    salida(f"  aditivo mediana : {fee_mediana:+.5f} €/kWh  <- RECOMENDADO")
+    salida(f"  por bloque (exp): " + ", ".join(f"{b}: {v:+.5f}" for b, v in fee_bloques.items()))
 
-    salida("\nMes      | real    | modelo sin fee | +fee aditivo | +fee bloques | desv. aditivo | desv. bloques")
+    salida("\nMes      | real    | sin fee | +fee media | +fee mediana | +fee bloques | desv. media | desv. mediana")
     for x in meses:
-        est_adit = x["precio_modelo_sin_fee"] + fee_aditivo
+        est_media = x["precio_modelo_sin_fee"] + fee_media
+        est_mediana = x["precio_modelo_sin_fee"] + fee_mediana
         if x.get("kwh_p"):
             b_dom = m._bloque_de_periodo(max(x["kwh_p"], key=x["kwh_p"].get))
         else:
             b_dom = "P1P2"
         est_bloq = x["precio_modelo_sin_fee"] * (1 + fee_bloques.get(b_dom, 0.0))
         etiqueta = "train" if x in train else "TEST"
-        salida(f"{x['mes']} | {x['precio_real']:.4f} |     {x['precio_modelo_sin_fee']:.4f}     |"
-               f"  {est_adit:.4f}   |  {est_bloq:.4f}   |"
-               f" {100*(est_adit/x['precio_real']-1):+5.1f} % | {100*(est_bloq/x['precio_real']-1):+5.1f} % [{etiqueta}]")
+        salida(f"{x['mes']} | {x['precio_real']:.4f} | {x['precio_modelo_sin_fee']:.4f} |"
+               f"  {est_media:.4f}  |   {est_mediana:.4f}   |   {est_bloq:.4f}    |"
+               f" {100*(est_media/x['precio_real']-1):+5.1f} % | {100*(est_mediana/x['precio_real']-1):+5.1f} % [{etiqueta}]")
 
     def mostrar(nom, conjunto, fee):
         if not conjunto:
             return None
         r = m.metricas(conjunto, fee)
-        salida(f"  {nom:<30} MAE {r['mae']:.5f} | MAPE {r['mape']:.2f} % | sesgo {r['sesgo']:+.5f} "
+        salida(f"  {nom:<28} MAE {r['mae']:.5f} | MAPE {r['mape']:.2f} % | sesgo {r['sesgo']:+.5f} "
                f"({r['sesgo_pct']:+.2f} %) | desv. típica {r['desv_tipica']:.5f}")
         return r
 
+    resultados = {}
     for etiqueta, conjunto in (("ENTRENAMIENTO", train), ("PRUEBA (fuera de muestra)", test)):
         if conjunto:
             salida(f"\n{etiqueta} ({nombre}): {len(conjunto)} meses")
-            mostrar("sin fee", conjunto, 0.0)
-            mostrar(f"fee aditivo {fee_aditivo:.5f}", conjunto, fee_aditivo)
-            mostrar("fee por bloque (ridge fuerte)", conjunto, fee_bloques)
-            mostrar(f"fee fijo {fee_fijo}", conjunto, fee_fijo)
+            resultados[etiqueta] = {
+                "sin_fee": mostrar("sin fee", conjunto, 0.0),
+                "media": mostrar(f"fee media {fee_media:+.5f}", conjunto, fee_media),
+                "mediana": mostrar(f"fee mediana {fee_mediana:+.5f}", conjunto, fee_mediana),
+                "bloques": mostrar("fee por bloque (exp)", conjunto, fee_bloques),
+            }
 
     evaluados = test if test else [x for x in meses if x["kwh_p"]]
-    r_adit = m.metricas(evaluados, fee_aditivo)
-    r_bloq = m.metricas(evaluados, fee_bloques)
     r_sin = m.metricas(evaluados, 0.0)
+    r_media = m.metricas(evaluados, fee_media)
+    r_mediana = m.metricas(evaluados, fee_mediana)
+    r_bloq = m.metricas(evaluados, fee_bloques)
 
-    peor_adit = max(abs(p) for p in r_adit["por_mes_pct"])
-    peor_bloq = max(abs(p) for p in r_bloq["por_mes_pct"])
     peor_sin = max(abs(p) for p in r_sin["por_mes_pct"])
-
-    ok_adit = r_adit["mape"] <= 8.0 and abs(r_adit["sesgo_pct"]) <= 5.0 and peor_adit <= 15.0
-    ok_sin = r_sin["mape"] <= 8.0 and abs(r_sin["sesgo_pct"]) <= 5.0 and peor_sin <= 15.0
-    ok_bloq = r_bloq["mape"] <= 8.0 and abs(r_bloq["sesgo_pct"]) <= 5.0 and peor_bloq <= 15.0
+    peor_media = max(abs(p) for p in r_media["por_mes_pct"])
+    peor_mediana = max(abs(p) for p in r_mediana["por_mes_pct"])
+    peor_bloq = max(abs(p) for p in r_bloq["por_mes_pct"])
 
     salida(f"\nCRITERIO RELAJADO para {nombre} (MAPE<=8%, |sesgo|<=5%, peor<=15%):")
-    salida(f"  sin fee     -> MAPE {r_sin['mape']:.2f} %, sesgo {r_sin['sesgo_pct']:+.2f} %, peor {peor_sin:.1f} % => {'APTO' if ok_sin else 'NO APTO'}")
-    salida(f"  fee aditivo -> MAPE {r_adit['mape']:.2f} %, sesgo {r_adit['sesgo_pct']:+.2f} %, peor {peor_adit:.1f} % => {'APTO' if ok_adit else 'NO APTO'}")
-    salida(f"  fee bloques -> MAPE {r_bloq['mape']:.2f} %, sesgo {r_bloq['sesgo_pct']:+.2f} %, peor {peor_bloq:.1f} % => {'APTO' if ok_bloq else 'NO APTO'}")
+    for nom, r, peor in (("sin fee", r_sin, peor_sin),
+                          ("fee media", r_media, peor_media),
+                          ("fee mediana", r_mediana, peor_mediana),
+                          ("fee bloques", r_bloq, peor_bloq)):
+        ok = r["mape"] <= 8.0 and abs(r["sesgo_pct"]) <= 5.0 and peor <= 15.0
+        salida(f"  {nom:<14} -> MAPE {r['mape']:5.2f} %, sesgo {r['sesgo_pct']:+6.2f} %, peor {peor:5.1f} % => {'APTO' if ok else 'NO APTO'}")
 
-    candidatos = {"sin fee": r_sin["mape"], "fee aditivo": r_adit["mape"], "fee bloques": r_bloq["mape"]}
+    candidatos = {"sin fee": r_sin["mape"], "fee media": r_media["mape"],
+                  "fee mediana": r_mediana["mape"], "fee bloques": r_bloq["mape"]}
     mejor = min(candidatos, key=candidatos.get)
     salida(f"  MODELO RECOMENDADO: {mejor} (MAPE {candidatos[mejor]:.2f} %)")
 
-    return {"fee_aditivo": fee_aditivo, "fee_bloques": fee_bloques,
+    return {"fee_media": fee_media, "fee_mediana": fee_mediana, "fee_bloques": fee_bloques,
             "mejor": mejor, "incluye": incluye}
 
 
-def walk_forward(facturas, datos_indicador, incluye, min_train=6):
-    """Walk-forward: entrena con [0..t-1], predice t. Sin leakage.
+def walk_forward(facturas, datos_indicador, incluye, min_train=6, ventana=6, alpha=0.5):
+    """Walk-forward con ventana móvil y ancla a media móvil 3m del precio real.
 
-    Calcula precio_modelo_sin_fee para TODOS los meses antes de calibrar,
-    evitando el KeyError de la versión anterior.
+    Para cada mes t:
+      - Entrena con los últimos `ventana` meses con datos completos (excluye 2026-04).
+      - Fee = mediana robusta de residuales en esa ventana.
+      - pred_modelo = precio_modelo_sin_fee(t) + fee
+      - ancla = media móvil 3m del precio_real (meses con kwh_p)
+      - pred = alpha * pred_modelo + (1 - alpha) * ancla
     """
     meses = []
     for f in facturas:
@@ -154,23 +174,24 @@ def walk_forward(facturas, datos_indicador, incluye, min_train=6):
 
     resultados = []
     for t in range(min_train, len(meses)):
-        train = [x for x in meses[:t]
+        train = [x for x in meses[max(0, t - ventana):t]
                  if x["kwh"] > 0 and x["kwh_p"] and x["mes"] != "2026-04"]
         if len(train) < 3:
             continue
         test = meses[t]
-        fee_adit = m.calibrar_fee(train)
-        ini, fin, mes = limites_mes(test["mes"])
-        pred_adit, _, _ = m.precio_medio_ponderado(
-            datos_indicador, ini, fin, incluye, fee_adit,
-            kwh_periodos=test["kwh_p"],
-            pesos=u.PESOS_PERIODOS[mes], mes_calendario=mes)
-        pred_sin = test["precio_modelo_sin_fee"]
+        fee = m.calibrar_fee_robusto(train)
+        pred_modelo = test["precio_modelo_sin_fee"] + fee
+        previos = [x["precio_real"] for x in meses[max(0, t - 3):t] if x["kwh_p"]]
+        ancla = sum(previos) / len(previos) if previos else pred_modelo
+        pred_ancla = alpha * pred_modelo + (1 - alpha) * ancla
         resultados.append({
             "mes": test["mes"], "real": test["precio_real"],
-            "pred_adit": pred_adit, "pred_sin": pred_sin,
-            "pct_adit": 100 * (pred_adit / test["precio_real"] - 1),
-            "pct_sin": 100 * (pred_sin / test["precio_real"] - 1),
+            "pred_media": test["precio_modelo_sin_fee"] + m.calibrar_fee(train),
+            "pred_mediana": pred_modelo,
+            "pred_ancla": pred_ancla,
+            "pct_media": 100 * ((test["precio_modelo_sin_fee"] + m.calibrar_fee(train)) / test["precio_real"] - 1),
+            "pct_mediana": 100 * (pred_modelo / test["precio_real"] - 1),
+            "pct_ancla": 100 * (pred_ancla / test["precio_real"] - 1),
         })
     return resultados
 
@@ -180,17 +201,17 @@ def reporte_walk_forward(resultados, nombre):
     if not resultados:
         print(f"\nWALK-FORWARD {nombre}: sin meses suficientes")
         return
-    pcts_a = [r["pct_adit"] for r in resultados]
-    pcts_s = [r["pct_sin"] for r in resultados]
     print(f"\nWALK-FORWARD {nombre}: {len(resultados)} meses out-of-sample")
-    print("Mes      | real    | pred adit | desv adit | pred sin | desv sin")
+    print("Mes      | real    | fee media | fee mediana | fee+ancla(α) | desv media | desv mediana | desv ancla")
     for r in resultados:
-        print(f"{r['mes']} | {r['real']:.4f} | {r['pred_adit']:.4f} | {r['pct_adit']:+7.1f} % | "
-              f"{r['pred_sin']:.4f} | {r['pct_sin']:+7.1f} %")
-    print(f"  fee aditivo -> MAPE {st.mean(abs(p) for p in pcts_a):.2f} % | "
-          f"sesgo {st.mean(pcts_a):+.2f} % | peor {max(abs(p) for p in pcts_a):.1f} %")
-    print(f"  sin fee     -> MAPE {st.mean(abs(p) for p in pcts_s):.2f} % | "
-          f"sesgo {st.mean(pcts_s):+.2f} % | peor {max(abs(p) for p in pcts_s):.1f} %")
+        print(f"{r['mes']} | {r['real']:.4f} |  {r['pred_media']:.4f}   |   {r['pred_mediana']:.4f}    |"
+              f"   {r['pred_ancla']:.4f}     | {r['pct_media']:+6.1f} % |  {r['pct_mediana']:+6.1f} %  | {r['pct_ancla']:+6.1f} %")
+    for clave, nom in (("pct_media", "fee media      "),
+                       ("pct_mediana", "fee mediana    "),
+                       ("pct_ancla", "fee mediana+ancla")):
+        pcts = [r[clave] for r in resultados]
+        print(f"  {nom} -> MAPE {st.mean(abs(p) for p in pcts):5.2f} % | "
+              f"sesgo {st.mean(pcts):+6.2f} % | peor {max(abs(p) for p in pcts):5.1f} %")
 
 
 def main(argv):
@@ -200,6 +221,9 @@ def main(argv):
 
     train_hasta = argv[argv.index("--train-hasta") + 1] if "--train-hasta" in argv else None
     fee_fijo = float(argv[argv.index("--fee-fijo") + 1]) if "--fee-fijo" in argv else 0.0052
+    ventana = int(argv[argv.index("--ventana") + 1]) if "--ventana" in argv else 6
+    alpha = float(argv[argv.index("--alpha") + 1]) if "--alpha" in argv else 0.5
+
     facturas = leer_facturas(argv[1])
 
     ini = limites_mes(facturas[0]["mes"])[0]
@@ -219,10 +243,10 @@ def main(argv):
         incluye=None, train_hasta=train_hasta, fee_fijo=fee_fijo)
 
     print(f"\n{'='*70}")
-    print(" WALK-FORWARD (sin leakage, 2026-04 excluido del train)")
+    print(f" WALK-FORWARD (ventana={ventana}m, alpha={alpha}, 2026-04 fuera del train)")
     print(f"{'='*70}")
     for nombre, datos, incluye in (("SPOT", spot_data, False), ("PVPC", pvpc_data, False)):
-        wf = walk_forward(facturas, datos, incluye)
+        wf = walk_forward(facturas, datos, incluye, ventana=ventana, alpha=alpha)
         reporte_walk_forward(wf, nombre)
 
     return 0
