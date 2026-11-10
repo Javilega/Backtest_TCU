@@ -1,16 +1,15 @@
 """Backtest TEV + TETA con predicción operativa (sin leakage).
 
 - TEV: SPOT 600 × (1 + pérdidas) ponderado por kWh reales (retrospectivo).
-- TETA: peajes + cargos oficiales ponderados por PERFIL DE CONSUMO PREVISTO
-  (solo datos anteriores al mes objetivo, sin leakage).
+- TETA: peajes + cargos oficiales ponderados por PERFIL DE CONSUMO PREVISTO.
 
-El perfil previsto usa, en este orden:
-  1. Perfil real del mismo mes en años anteriores.
-  2. Perfil del mes anterior disponible.
-  3. Media de los perfiles de los últimos 3 meses disponibles.
+Perfiles:
+  - Meses de invierno (oct-may): perfil medio de todos los inviernos del histórico.
+    Es más estable porque el patrón de calefacción se repite año a año.
+  - Meses de verano (jun-may): fallback (mismo mes año anterior / mes anterior / media 3m).
 
-Si no hay histórico suficiente, el mes se omite del cálculo de TETA
-(pero sigue en el de TEV, que no depende de perfiles).
+La evaluación final se filtra para mostrar solo los meses de calefacción (oct-may),
+que son los que importan para decidir entre aerotermia y radiadores.
 """
 import os, sys, calendar, datetime as dt
 import umbrales as u
@@ -18,6 +17,8 @@ import tcu_modelo as m
 import teta_regulado as teta
 from dotenv import load_dotenv
 load_dotenv()
+
+MESES_INVIERNO = {10, 11, 12, 1, 2, 3, 4, 5}
 
 
 def leer_facturas(ruta):
@@ -76,15 +77,29 @@ def limites_mes(texto):
     return ini, fin, mes
 
 
-def perfil_consumo_previsto(mes_objetivo, historico):
-    """Perfil de consumo por periodo previsto para un mes futuro.
+def es_invierno(mes_str):
+    return int(mes_str.split("-")[1]) in MESES_INVIERNO
 
-    Solo usa datos ANTERIORES al mes objetivo. Sin leakage.
-    Devuelve dict {periodo: fraccion} que suma 1.
+
+def perfil_invierno(historico):
+    """Perfil medio de todos los meses de invierno del histórico.
+
+    Es más estable que el mismo mes año anterior porque agrega varios inviernos.
     """
+    meses_inv = [f for f in historico
+                 if es_invierno(f["mes"]) and f["kwh_p"]]
+    if not meses_inv:
+        raise ValueError("Sin meses de invierno en el histórico")
+    total = sum(sum(f["kwh_p"].values()) for f in meses_inv)
+    return {p: sum(f["kwh_p"].get(p, 0) for f in meses_inv) / total
+            for p in range(1, 7)
+            if any(f["kwh_p"].get(p, 0) > 0 for f in meses_inv)}
+
+
+def perfil_verano_fallback(mes_objetivo, historico):
+    """Fallback para meses de verano: mismo mes año anterior / mes anterior / media 3m."""
     anio, mes = (int(x) for x in mes_objetivo.split("-"))
 
-    # 1. Mismo mes en años anteriores
     mismo_mes = [f for f in historico
                  if f["mes"].endswith(f"-{mes:02d}")
                  and int(f["mes"].split("-")[0]) < anio
@@ -96,7 +111,6 @@ def perfil_consumo_previsto(mes_objetivo, historico):
                     for p in range(1, 7)
                     if any(f["kwh_p"].get(p, 0) > 0 for f in mismo_mes)}
 
-    # 2. Mes anterior
     anteriores = [f for f in historico if f["mes"] < mes_objetivo and f["kwh_p"]]
     if anteriores:
         ultimo = anteriores[-1]
@@ -104,7 +118,6 @@ def perfil_consumo_previsto(mes_objetivo, historico):
         if total > 0:
             return {p: k / total for p, k in ultimo["kwh_p"].items() if k > 0}
 
-    # 3. Media de últimos 3
     ultimos_3 = anteriores[-3:] if len(anteriores) >= 3 else anteriores
     if ultimos_3:
         total = sum(sum(f["kwh_p"].values()) for f in ultimos_3)
@@ -117,45 +130,46 @@ def perfil_consumo_previsto(mes_objetivo, historico):
 
 
 def evaluar_operativo(spot_data, facturas, train_hasta):
-    """Backtest operativo: TEV + TETA sin usar datos reales del mes objetivo."""
     print(f"\n{'='*70}\n BACKTEST OPERATIVO (sin leakage)\n{'='*70}")
 
     meses = []
     for i, f in enumerate(facturas):
         if f["tev_real"] is None:
             continue
-
         historico = facturas[:i]
-
         ini, fin, mes = limites_mes(f["mes"])
         anio = int(f["mes"].split("-")[0])
 
-        # TEV base: SPOT × (1+pérdidas), ponderado por kWh REALES
         try:
-            tev_base = m.tev_base_ponderado(spot_data, ini, fin, f["kwh_p"], mes)
+            tev_base, info_tev = m.tev_base_ponderado(spot_data, ini, fin, f["kwh_p"], mes)
+            if info_tev["ignorados"]:
+                print(f"AVISO {f['mes']}: TEV ignoró periodos {info_tev['ignorados']}")
         except ValueError as e:
             print(f"AVISO {f['mes']}: no se puede calcular TEV ({e}). Se omite.")
             continue
 
-        # TETA operativo: usa PERFIL PREVISTO, no kWh reales
+        # --- TETA operativo ---
         if not historico:
             print(f"AVISO {f['mes']}: sin histórico previo. Se omite del cálculo de TETA.")
             teta_est = None
             origen_perfil = "sin_historico"
         else:
             try:
-                pesos_prev = perfil_consumo_previsto(f["mes"], historico)
-                teta_est = teta.teta_estimado(anio, pesos_prev)
-                origen_perfil = "mismo_mes" if any(
-                    h["mes"].endswith(f"-{mes:02d}") and int(h["mes"].split("-")[0]) < anio
-                    for h in historico) else "fallback"
+                if es_invierno(f["mes"]):
+                    pesos = perfil_invierno(historico)
+                    origen_perfil = "perfil_invierno"
+                else:
+                    pesos = perfil_verano_fallback(f["mes"], historico)
+                    origen_perfil = "fallback_verano"
+                teta_est = teta.teta_estimado(anio, pesos)
             except ValueError as e:
                 print(f"AVISO {f['mes']}: {e}")
                 teta_est = None
                 origen_perfil = "sin_datos"
 
         meses.append({**f, "tev_base": tev_base, "teta_est": teta_est,
-                      "anio": anio, "origen_perfil": origen_perfil})
+                      "anio": anio, "origen_perfil": origen_perfil,
+                      "info_tev": info_tev})
 
     train = [x for x in meses if train_hasta is None or x["mes"] <= train_hasta]
     test = [x for x in meses if train_hasta is not None and x["mes"] > train_hasta]
@@ -168,7 +182,7 @@ def evaluar_operativo(spot_data, facturas, train_hasta):
     fee = m.calibrar_fee_tev(train_k)
     print(f"Fee TEV calibrado (train hasta {train_hasta}): {fee:+.5f} €/kWh")
 
-    # --- Evaluación TEV (retrospectiva, kWh reales) ---
+    # --- Evaluación TEV ---
     print(f"\n{'='*70}\n EVALUACIÓN TEV (retrospectiva, kWh reales)\n{'='*70}")
     print("Mes      | TEV real | TEV base | TEV+fee | Error %")
     for x in meses:
@@ -177,7 +191,7 @@ def evaluar_operativo(spot_data, facturas, train_hasta):
         etiqueta = "train" if x in train else "TEST"
         print(f"{x['mes']} |  {x['tev_real']:.4f}  |  {x['tev_base']:.4f}  | {tev_est:.4f} | {err:+6.1f} % [{etiqueta}]")
 
-    # --- Evaluación TETA (operativa, perfil previsto) ---
+    # --- Evaluación TETA ---
     print(f"\n{'='*70}\n EVALUACIÓN TETA (operativa, perfil previsto)\n{'='*70}")
     print("Mes      | TETA est | TETA real | Error % | Origen perfil")
     errores_teta = []
@@ -187,13 +201,13 @@ def evaluar_operativo(spot_data, facturas, train_hasta):
             errores_teta.append(abs(err))
             print(f"{x['mes']} |  {x['teta_est']:.4f}  |  {x['teta_real']:.4f}  | {err:+6.2f} % | {x['origen_perfil']}")
     if errores_teta:
-        print(f"\n  TETA MAPE (sobre meses con TETA real): {sum(errores_teta) / len(errores_teta):.2f} %")
-        print(f"  TETA peor mes: {max(errores_teta):.2f} %")
+        print(f"\n  TETA MAPE (todos los meses): {sum(errores_teta) / len(errores_teta):.2f} %")
 
     # --- Evaluación final: TEV + TETA ---
     print(f"\n{'='*70}\n EVALUACIÓN FINAL: TEV + TETA (sin impuestos)\n{'='*70}")
-    print("Mes      | TEV est | TETA est | TOTAL est | TOTAL real | Error %")
+    print("Mes      | TEV est | TETA est | TOTAL est | TOTAL real | Error % | Estación")
     errores_final = []
+    errores_final_inv = []
     for x in meses:
         if x.get("teta_est") is None:
             continue
@@ -203,23 +217,42 @@ def evaluar_operativo(spot_data, facturas, train_hasta):
             total_real = x["tev_real"] + x["teta_real"]
             err = 100 * (total_est / total_real - 1)
             errores_final.append(abs(err))
+            estacion = "invierno" if es_invierno(x["mes"]) else "verano"
+            if es_invierno(x["mes"]):
+                errores_final_inv.append(abs(err))
             etiqueta = "train" if x in train else "TEST"
-            print(f"{x['mes']} | {tev_est:.4f} | {x['teta_est']:.4f} |  {total_est:.4f}  |   {total_real:.4f}   | {err:+6.1f} % [{etiqueta}]")
+            print(f"{x['mes']} | {tev_est:.4f} | {x['teta_est']:.4f} |  {total_est:.4f}  |   {total_real:.4f}   | {err:+6.1f} % [{etiqueta}] [{estacion}]")
+
+    print(f"\n{'='*70}\n RESULTADOS POR ESTACIÓN\n{'='*70}")
     if errores_final:
-        print(f"\n  TOTAL MAPE (sobre meses con TEV+TETA reales): {sum(errores_final) / len(errores_final):.2f} %")
-        print(f"  TOTAL peor mes: {max(errores_final):.2f} %")
+        print(f"  TOTAL MAPE (todos los meses):    {sum(errores_final) / len(errores_final):.2f} % (n={len(errores_final)})")
+    if errores_final_inv:
+        print(f"  TOTAL MAPE (solo invierno oct-may): {sum(errores_final_inv) / len(errores_final_inv):.2f} % (n={len(errores_final_inv)})")
+        print(f"  TOTAL peor mes invierno:         {max(errores_final_inv):.2f} %")
 
     # --- Veredicto ---
     print(f"\n{'='*70}\n VEREDICTO\n{'='*70}")
     if test:
         r = m.metricas_tev(test, fee)
         ok_tev = r["mape"] <= 10 and abs(r["sesgo_pct"]) <= 5
-        print(f"TEV OOS: MAPE {r['mape']:.2f} %, sesgo {r['sesgo_pct']:+.2f} % → {'APTO' if ok_tev else 'NO APTO'}")
-    if errores_final:
-        mape_total = sum(errores_final) / len(errores_final)
-        ok_total = mape_total <= 10
-        print(f"TOTAL (TEV+TETA) OOS: MAPE {mape_total:.2f} % → {'APTO' if ok_total else 'NO APTO'}")
-    print("TETA: calculado con tablas regulatorias del BOE y perfil de consumo previsto.")
+        print(f"TEV OOS (todos):              MAPE {r['mape']:.2f} %, sesgo {r['sesgo_pct']:+.2f} % → {'APTO' if ok_tev else 'NO APTO'}")
+    
+    # Veredicto específico para invierno
+    test_inv = [x for x in test if es_invierno(x["mes"]) and x.get("teta_est")]
+    if test_inv:
+        errores_test_inv = []
+        for x in test_inv:
+            tev_est = x["tev_base"] + fee
+            total_est = tev_est + x["teta_est"]
+            if x["tev_real"] and x["teta_real"]:
+                total_real = x["tev_real"] + x["teta_real"]
+                errores_test_inv.append(abs(100 * (total_est / total_real - 1)))
+        if errores_test_inv:
+            mape_inv = sum(errores_test_inv) / len(errores_test_inv)
+            ok_inv = mape_inv <= 10
+            print(f"TOTAL OOS INVERSO (oct-may): MAPE {mape_inv:.2f} % (n={len(errores_test_inv)}) → {'APTO' if ok_inv else 'NO APTO'}")
+    
+    print("TETA: calculado con tablas regulatorias del BOE y perfil de invierno fijo.")
     print("2026-04 excluido del entrenamiento (sin desglose por periodos).")
 
 
