@@ -22,9 +22,6 @@ def periodo_20td(hora_local):
 
 def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee=0.0, mes_calendario=None,
                      perdidas_20td=None, perdidas_30td=None, solo_energia=False):
-    """Calcula el precio de una hora. 
-    Si solo_energia=True, devuelve SOLO el coste de producción (pool+perdidas), sin peajes ni cargos.
-    """
     perdidas_20td = perdidas_20td or PERDIDAS_20TD
     perdidas_30td = perdidas_30td or PERDIDAS_30TD_OFICIALES
     local = t_utc.astimezone(u.TZ)
@@ -35,9 +32,7 @@ def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee=0.0, mes_calendario=None,
         energia = energia / (1 + perdidas_20td[periodo_20td(local)])
     energia = energia * (1 + perdidas_30td[p3])
     
-    # El fee ahora es multiplicativo sobre la energía (margen comercial)
     if isinstance(fee, dict):
-        # (Mantenemos compatibilidad con la versión anterior, aunque ya no usamos fee por bloque)
         energia = energia * (1 + fee.get("P1P2" if p3 in (1,2) else ("P3P4" if p3 in (3,4) else "P5P6"), 0.0))
     else:
         energia = energia + fee
@@ -55,10 +50,13 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
             precio, p = precio_hora_30td(t, v, incluye_perdidas, fee, mes_calendario, solo_energia=solo_energia)
             horas[p].append(precio)
     
+    # CLAVE: Si tenemos kwh_periodos, solo procesamos los periodos con consumo > 0
     if kwh_periodos:
-        pesos_p, nivel = {p: k for p, k in kwh_periodos.items() if k > 0}, "kWh facturados"
+        pesos_p = {p: k for p, k in kwh_periodos.items() if k > 0}
+        nivel = "kWh facturados"
     else:
-        pesos_p, nivel = {p: w for p, w in (pesos or {}).items() if w > 0}, "pesos estacionales"
+        pesos_p = {p: w for p, w in (pesos or {}).items() if w > 0}
+        nivel = "pesos estacionales"
     
     if not pesos_p:
         raise ValueError("Faltan kWh por periodo o pesos para ponderar")
@@ -66,8 +64,9 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
     total = suma = 0.0
     detalle = {}
     for p, w in pesos_p.items():
+        # Si el periodo tiene consumo, comprobamos que haya precios
         if len(horas[p]) < 24:
-            raise ValueError(f"Faltan precios del periodo P{p}")
+            raise ValueError(f"Faltan precios del periodo P{p} ({len(horas[p])} horas)")
         media = sum(horas[p]) / len(horas[p])
         detalle[p] = (len(horas[p]), media, w)
         total += w * media
@@ -114,7 +113,6 @@ def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
     return "AMBIGUO", pendientes
 
 def calibrar_fee(meses):
-    """Fee aditivo sobre el coste de la energía (no sobre el precio total)."""
     base = sum(m["kwh"] for m in meses)
     if base <= 0:
         raise ValueError("Sin kWh para ponderar la calibración")
@@ -147,4 +145,4 @@ def metricas(meses, fee, columna_real="coste_energia_real"):
         "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
         "por_mes_pct": pct,
         "error_euros": [e * w for e, w in zip(err, kwh)],
-  }
+    }
