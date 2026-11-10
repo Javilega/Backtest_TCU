@@ -7,17 +7,43 @@ load_dotenv()
 
 def leer_facturas(ruta):
     filas = []
-    with open(ruta, encoding="utf-8", newline="") as f:
-        for r in csv.DictReader(f):
-            kwh_p = {p: float(r[f"kwh_p{p}"]) for p in range(1, 7)
-                     if (r.get(f"kwh_p{p}") or "").strip()}
-            total = (r.get("kwh_total") or "").strip()
+    with open(ruta, encoding="utf-8-sig", newline="") as f:
+        # Detectar automáticamente el separador (coma o punto y coma)
+        muestra = f.read(2048)
+        f.seek(0)
+        dialecto = csv.Sniffer().sniff(muestra, delimiters=",;")
+        
+        lector = csv.DictReader(f, dialect=dialecto)
+        
+        # Limpiar posibles espacios en los nombres de las columnas
+        if lector.fieldnames:
+            lector.fieldnames = [name.strip() for name in lector.fieldnames]
+
+        for r in lector:
+            # Saltar líneas vacías
+            if not r.get("mes") or not r["mes"].strip():
+                continue
+                
+            kwh_p = {}
+            for p in range(1, 7):
+                valor = r.get(f"kwh_p{p}", "")
+                if valor and str(valor).strip():
+                    try:
+                        kwh_p[p] = float(str(valor).replace(",", "."))
+                    except ValueError:
+                        pass
+            
+            total = r.get("kwh_total", "")
+            def parse_float(val):
+                if not val or not str(val).strip(): return None
+                return float(str(val).replace(",", "."))
+
             filas.append({
                 "mes": r["mes"].strip(),
-                "precio_real_original": float(r["precio_real_original"]) if r.get("precio_real_original") else None,
-                "coste_energia_real": float(r["coste_energia_real"]) if r.get("coste_energia_real") else None,
-                "peajes_cargos_real": float(r["peajes_cargos_real"]) if r.get("peajes_cargos_real") else None,
-                "kwh": float(total) if total else (sum(kwh_p.values()) if kwh_p else 0.0),
+                "precio_real_original": parse_float(r.get("precio_real_original")),
+                "coste_energia_real": parse_float(r.get("coste_energia_real")),
+                "peajes_cargos_real": parse_float(r.get("peajes_cargos_real")),
+                "kwh": parse_float(total) if parse_float(total) else (sum(kwh_p.values()) if kwh_p else 0.0),
                 "kwh_p": kwh_p or None,
             })
     return sorted(filas, key=lambda x: x["mes"])
@@ -48,7 +74,7 @@ def evaluar_indicador(nombre, datos_indicador, pvpc_referencia, facturas, incluy
     for f in facturas:
         if f["coste_energia_real"] is None: continue
         ini, fin, mes = limites_mes(f["mes"])
-        # AQUI ESTA LA CLAVE: solo_energia=True
+        # El modelo solo predice el coste de energía (TEV)
         precio, _, _ = m.precio_medio_ponderado(
             datos_indicador, ini, fin, incluye, 0.0, kwh_periodos=f["kwh_p"],
             mes_calendario=mes, solo_energia=True)
@@ -57,6 +83,10 @@ def evaluar_indicador(nombre, datos_indicador, pvpc_referencia, facturas, incluy
     train = [x for x in meses if train_hasta is None or x["mes"] <= train_hasta]
     test = [x for x in meses if train_hasta is not None and x["mes"] > train_hasta]
     train_k = [x for x in train if x["kwh"] > 0 and x["kwh_p"] and x["mes"] != "2026-04"]
+
+    if not train_k:
+        salida("ERROR: No hay meses válidos para entrenar. Revisa que el CSV tenga las columnas correctas.")
+        return None
 
     fee_media = m.calibrar_fee(train_k)
     fee_mediana = m.calibrar_fee_robusto(train_k)
