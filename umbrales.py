@@ -6,13 +6,21 @@ import holidays
 TZ = ZoneInfo("Europe/Madrid")
 FESTIVOS_ES = holidays.ES()
 
+
 def _leer_descuento():
-    valor = float(os.environ.get("DESCUENTO", "42.5").replace(",", "."))
+    texto = os.environ.get("DESCUENTO", "").strip().replace(",", ".")
+    if not texto:
+        return 0.425
+    try:
+        valor = float(texto)
+    except ValueError:
+        return 0.425
     if valor >= 1:
         valor /= 100
     if not 0 <= valor < 1:
         raise ValueError(f"DESCUENTO no válido: {valor}")
     return valor
+
 
 DESCUENTO_FAMILIA_NUMEROSA = _leer_descuento()
 FACTOR_AEROTERMIA = 0.58
@@ -32,28 +40,34 @@ PESOS_PERIODOS = {
     12: {1: 30.85, 2: 20.59, 6: 48.56},
 }
 
+
 def _leer_ajuste():
     texto = os.environ.get("FACTOR_AJUSTE_30TD", "").strip().replace(",", ".")
+    if not texto:
+        return 1.0
     try:
-        valor = float(texto) if texto else 1.0
+        valor = float(texto)
     except ValueError:
         return 1.0
     return valor if 0.3 <= valor <= 1.5 else 1.0
+
 
 FACTOR_AJUSTE_30TD = _leer_ajuste()
 
 PEAJES_30TD = {1: 0.027511, 2: 0.012376, 3: 0.004943, 4: 0.002627, 5: 0.000111, 6: 0.000031}
 CARGOS_30TD = {1: 0.035841, 2: 0.026538, 3: 0.014336, 4: 0.007168, 5: 0.004595, 6: 0.002867}
-# Coeficientes oficiales de pérdidas 3.0TD (contador -> barras de central), Circular 3/2020 de la CNMC
-# modificada por la Circular 7/2020. Sustituyen a los valores anteriores, que no tenían justificación.
 PERDIDAS_30TD = {1: 0.166, 2: 0.175, 3: 0.165, 4: 0.165, 5: 0.138, 6: 0.180}
+
 
 def _leer_margen():
     texto = os.environ.get("MARGEN_COMERCIAL", "").strip().replace(",", ".")
+    if not texto:
+        return None
     try:
-        return float(texto) if texto else None
+        return float(texto)
     except ValueError:
         return None
+
 
 MARGEN_COMERCIAL = _leer_margen()
 VERANO_DESDE = (5, 15)
@@ -64,30 +78,34 @@ FACTORES_INYECCION_MENSUAL = {
     7: 0.40, 8: 0.40, 9: 0.40, 10: 0.45, 11: 0.55, 12: 0.65,
 }
 
+
 def _leer_dias():
     try:
         return max(1, int(os.environ.get("DIAS_MEDIA", "").strip() or 30))
     except ValueError:
         return 30
 
-DIAS_MEDIA = _leer_dias()                  
-DIAS_CACHE = max(35, DIAS_MEDIA + 5)       
+
+DIAS_MEDIA = _leer_dias()
+DIAS_CACHE = max(35, DIAS_MEDIA + 5)
+
 
 def ahora_utc():
     return dt.datetime.now(dt.timezone.utc)
 
+
 def medianoche(fecha):
     return dt.datetime.combine(fecha, dt.time(0, 0), tzinfo=TZ)
 
+
 SERIES = {
-    "pvpc": {"indicador": 1001, "geo": 8741, "cache": os.path.join("datos", "precios.json")},  
-    "spot": {"indicador": 600, "geo": 3, "cache": os.path.join("datos", "spot.json")},          
+    "pvpc": {"indicador": 1001, "geo": 8741, "cache": os.path.join("datos", "precios.json")},
+    "spot": {"indicador": 600, "geo": 3, "cache": os.path.join("datos", "spot.json")},
 }
+
 
 def pedir_esios(ini, fin, serie="pvpc"):
     cfg = SERIES[serie]
-    
-    # Dividimos la consulta en bloques de 90 días para evitar el timeout de ESIOS
     por_hora = {}
     paso = dt.timedelta(days=90)
     sub_ini = ini
@@ -95,7 +113,6 @@ def pedir_esios(ini, fin, serie="pvpc"):
     while sub_ini < fin:
         sub_fin = min(sub_ini + paso, fin)
         ultimo = None
-        
         for intento in range(1, 4):
             try:
                 r = requests.get(
@@ -110,11 +127,11 @@ def pedir_esios(ini, fin, serie="pvpc"):
                 r.raise_for_status()
                 for v in r.json()["indicator"]["values"]:
                     if v.get("geo_id") not in (None, cfg["geo"]):
-                        continue                      
+                        continue
                     t = dt.datetime.fromisoformat(v["datetime_utc"].replace("Z", "+00:00"))
                     t = t.replace(minute=0, second=0, microsecond=0)
                     por_hora.setdefault(t, []).append(v["value"] / 1000)
-                break  # Éxito en este tramo, pasar al siguiente
+                break
             except Exception as e:
                 ultimo = e
                 print(f"Intento {intento}/3 fallido para el tramo {sub_ini.date()} - {sub_fin.date()}: {e}")
@@ -122,13 +139,13 @@ def pedir_esios(ini, fin, serie="pvpc"):
                     time.sleep(5)
         else:
             raise RuntimeError(f"ESIOS no responde en el tramo {sub_ini.date()} - {sub_fin.date()}: {ultimo}")
-        
         sub_ini = sub_fin
 
     if not por_hora:
         raise ValueError("ESIOS no devolvió precios")
-        
     return sorted((t, sum(vs) / len(vs)) for t, vs in por_hora.items())
+
+
 def leer_cache(serie="pvpc"):
     try:
         with open(SERIES[serie]["cache"], encoding="utf-8") as f:
@@ -136,6 +153,7 @@ def leer_cache(serie="pvpc"):
         return sorted((dt.datetime.fromisoformat(k), float(v)) for k, v in crudo.items())
     except Exception:
         return []
+
 
 def guardar_cache(datos, serie="pvpc"):
     ruta = SERIES[serie]["cache"]
@@ -148,6 +166,7 @@ def guardar_cache(datos, serie="pvpc"):
         json.dump({"precios": {t.isoformat(): round(p, 6) for t, p in sorted(podado.items())}},
                   f, separators=(",", ":"))
 
+
 def precios(ini, fin, horas_clave, serie="pvpc"):
     guardados = [(t, p) for t, p in leer_cache(serie) if ini <= t < fin]
     esperadas = int((fin - ini).total_seconds() // 3600)
@@ -155,6 +174,7 @@ def precios(ini, fin, horas_clave, serie="pvpc"):
     if all(h in horas for h in horas_clave) and len(guardados) >= 0.9 * esperadas:
         return guardados, "caché"
     return pedir_esios(ini, fin, serie), "ESIOS"
+
 
 def media_de(datos, fecha, dias=None):
     dias = dias or DIAS_MEDIA
@@ -165,6 +185,7 @@ def media_de(datos, fecha, dias=None):
     if len(valores) < minimo:
         raise ValueError(f"Solo hay {len(valores)} precios en los {dias} días previos")
     return sum(valores) / len(valores)
+
 
 def periodo_3td(hora_local, mes):
     dia = hora_local.date()
@@ -182,20 +203,16 @@ def periodo_3td(hora_local, mes):
         return 3 if punta else 4
     return 4 if punta else 5
 
+
 def es_verano(fecha):
     return VERANO_DESDE <= (fecha.month, fecha.day) <= VERANO_HASTA
+
 
 def _hora_local(t):
     return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).astimezone(TZ)
 
 
 def _medias_por_periodo(serie, fecha, dias):
-    """Media del precio de los `dias` anteriores a `fecha` en cada periodo 3.0TD.
-
-    Toda la ventana se clasifica con el calendario (y los pesos) del MES DE `fecha`: así cada
-    periodo tiene siempre datos suficientes y no se mezclan calendarios de meses distintos.
-    Devuelve {periodo: (media, nº de horas)} solo para los periodos con peso ese mes.
-    """
     fin = medianoche(fecha)
     ini = medianoche(fecha - dt.timedelta(days=dias))
     pesos = PESOS_PERIODOS[fecha.month]
@@ -222,7 +239,7 @@ def precio_aerotermia(datos, fecha, dias=None):
     total = suma_pesos = 0.0
     for p, peso in pesos.items():
         media, n = medias[p]
-        if n < 24:                                  # menos de un día de datos en ese periodo
+        if n < 24:
             raise ValueError(f"Faltan precios del periodo P{p} para ponderar la aerotermia")
         total += peso * media
         suma_pesos += peso
@@ -249,6 +266,7 @@ def precio_aerotermia_spot(spot, fecha, dias=None, margen=None):
 
 Umbrales = collections.namedtuple("Umbrales", "media inyeccion eficiencia factor modo aerotermia metodo")
 
+
 def calcular_umbrales(datos, fecha, dias=None, spot=None):
     media = media_de(datos, fecha, dias)
     if es_verano(fecha):
@@ -256,14 +274,11 @@ def calcular_umbrales(datos, fecha, dias=None, spot=None):
     else:
         modo = "invierno"
         aero, metodo = None, "pvpc"
-        
-        # Guardián seguro para desempaquetados incorrectos
         if isinstance(spot, list) and len(spot) > 0 and MARGEN_COMERCIAL is not None and not os.environ.get("PRECIO_AEROTERMIA", "").strip():
             try:
                 aero, metodo = precio_aerotermia_spot(spot, fecha, dias)[0], "spot"
             except ValueError as e:
                 print(f"AVISO: no se pudo estimar con el mercado diario ({e}); se usa el PVPC ponderado")
-        
         if aero is None:
             aero = precio_aerotermia(datos, fecha, dias)
             if os.environ.get("PRECIO_AEROTERMIA", "").strip():
@@ -273,6 +288,7 @@ def calcular_umbrales(datos, fecha, dias=None, spot=None):
     eficiencia = base * FACTOR_AEROTERMIA / (1.0 - DESCUENTO_FAMILIA_NUMEROSA)
     factor = FACTORES_INYECCION_MENSUAL[fecha.month]
     return Umbrales(media, eficiencia * factor, eficiencia, factor, modo, aero, metodo)
+
 
 def decidir(precio, umbral_inyeccion, umbral_eficiencia, precio_anterior=None, umbral_anterior=None):
     if precio <= umbral_inyeccion:
