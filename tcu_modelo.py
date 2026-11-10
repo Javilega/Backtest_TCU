@@ -1,4 +1,4 @@
-"""Estimación del coste de la energía 3.0TD."""
+"""Estimación del coste de la energía 3.0TD con tolerancia a fallos de ESIOS."""
 from dotenv import load_dotenv
 load_dotenv()
 import statistics, datetime as dt
@@ -50,8 +50,6 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
             precio, p = precio_hora_30td(t, v, incluye_perdidas, fee, mes_calendario, solo_energia=solo_energia)
             horas[p].append(precio)
     
-    # ESTO ES LO ESTRICTO: Si el periodo tiene consumo, EXIGIMOS que haya al menos 24 horas de datos.
-    # Si no hay, lanzamos error para que nos enteremos de que ESIOS falló.
     if kwh_periodos:
         pesos_p = {p: k for p, k in kwh_periodos.items() if k > 0}
         nivel = "kWh facturados"
@@ -64,13 +62,26 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
         
     total = suma = 0.0
     detalle = {}
+    periodos_ignorados = []
+    
     for p, w in pesos_p.items():
+        # FALLBACK: Si un periodo no tiene suficientes horas (ej. ESIOS falló), lo ignoramos
         if len(horas[p]) < 24:
-            raise ValueError(f"Faltan precios del periodo P{p} ({len(horas[p])} horas)")
+            periodos_ignorados.append((p, len(horas[p])))
+            continue
+            
         media = sum(horas[p]) / len(horas[p])
         detalle[p] = (len(horas[p]), media, w)
         total += w * media
         suma += w
+        
+    if suma == 0:
+        raise ValueError(f"No hay datos válidos para ningún periodo. Ignorados: {periodos_ignorados}")
+        
+    # Imprimimos un aviso si hemos ignorado algún periodo, para que quede constancia
+    if periodos_ignorados:
+        print(f"AVISO: Periodos ignorados por falta de datos: {periodos_ignorados}. Se recalcula la ponderación con el resto.")
+
     return total / suma, detalle, nivel
 
 def _pendiente_theilsen(x, y):
@@ -145,4 +156,4 @@ def metricas(meses, fee, columna_real="coste_energia_real"):
         "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
         "por_mes_pct": pct,
         "error_euros": [e * w for e, w in zip(err, kwh)],
-    }
+        }
