@@ -1,5 +1,11 @@
 """Estimación del precio medio de la energía 3.0TD indexada (€/kWh, sin IVA ni impuesto eléctrico)
 a partir del TCU del PVPC (coste de producción de la energía) publicado en ESIOS.
+
+Modelos de fee disponibles:
+  - calibrar_fee: aditivo, media ponderada por kWh (original).
+  - calibrar_fee_robusto: aditivo, mediana winsorizada (recomendado).
+  - calibrar_fee_por_bloque: multiplicativo por bloque (EXPERIMENTO, no usar en producción:
+    los datos con 11-17 meses lo rechazan).
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -119,22 +125,41 @@ def diagnostico_perdidas_tcu(tcu, pvpc_1001, tolerancia=0.05, min_horas=48):
 
 
 def calibrar_fee(meses):
+    """Fee aditivo: media ponderada por kWh (original, sensible a outliers)."""
     base = sum(m["kwh"] for m in meses)
     if base <= 0:
         raise ValueError("Sin kWh para ponderar la calibración")
     return sum(m["kwh"] * (m["precio_real"] - m["precio_modelo_sin_fee"]) for m in meses) / base
 
 
-def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-1):
-    """Fee multiplicativo por bloque con regularización fuerte.
+def calibrar_fee_robusto(meses, winsor=0.10):
+    """Fee aditivo robusto: mediana winsorizada de los residuales.
 
-    Con 11-16 meses, ridge=1e-1 fuerza coeficientes cercanos a 0 (degenera al aditivo).
-    Se conserva como experimento comparativo; los datos rechazan el fee por bloque.
+    Ignora outliers (p.ej. 2025-01, 2025-02) que desplazan la media.
+    Recomendado para producción y walk-forward.
+    """
+    import numpy as np
+    res = [m["precio_real"] - m["precio_modelo_sin_fee"] for m in meses
+           if m.get("kwh", 0) > 0 and m.get("precio_modelo_sin_fee", 0) > 0]
+    if not res:
+        return 0.0
+    res = np.array(res, dtype=float)
+    if len(res) >= 3:
+        lo, hi = np.quantile(res, [winsor, 1 - winsor])
+        res = np.clip(res, lo, hi)
+    return float(np.median(res))
+
+
+def calibrar_fee_por_bloque(meses, winsor=0.05, ridge=1e-1):
+    """EXPERIMENTO: fee multiplicativo por bloque con regularización fuerte.
+
+    Los datos con 11-17 meses rechazan este modelo (MAPE 2-3x peor que el aditivo).
+    Se conserva solo para comparación en backtest. NO usar en producción.
     """
     import numpy as np
     filas = []
     for m in meses:
-        if not m.get("kwh_p") or m["precio_modelo_sin_fee"] <= 0:
+        if not m.get("kwh_p") or m.get("precio_modelo_sin_fee", 0) <= 0:
             continue
         r = m["precio_real"] / m["precio_modelo_sin_fee"] - 1.0
         tot = sum(m["kwh_p"].values())
@@ -186,4 +211,4 @@ def metricas(meses, fee):
         "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
         "por_mes_pct": pct,
         "error_euros": [e * w for e, w in zip(err, kwh)],
-        }
+                               }
