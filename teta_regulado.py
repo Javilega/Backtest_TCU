@@ -1,16 +1,24 @@
 """Tablas de peajes y cargos de energía 3.0TD (€/kWh) por periodo.
 
 FUENTE VERIFICADA:
-- Peajes: Resolución de 18 de diciembre de 2025, de la CNMC, por la que se
-  establecen los valores de los peajes de acceso a las redes de transporte y
-  distribución de electricidad de aplicación a partir del 1 de enero de 2026.
-  (BOE-A-2025-26348). Anexo, peaje 3.0TD, término de energía.
-- Cargos: Orden TED/1524/2025, de 23 de diciembre, por la que se establecen
-  los precios de los cargos del sistema eléctrico para 2026. Segmento 2.
+- 2025:
+  - Peajes: Resolución CNMC de diciembre de 2024 (BOE).
+  - Cargos: Orden TED/1487/2024.
+- 2026:
+  - Peajes: Resolución CNMC 18/12/2025 (BOE-A-2025-26348).
+  - Cargos: Orden TED/1524/2025, segmento 2.
 """
 
-# Peajes de energía 3.0TD (€/kWh) — Resolución CNMC 18/12/2025 (BOE-A-2025-26348)
+# Peajes de energía 3.0TD (€/kWh)
 PEAJES_ENERGIA_30TD = {
+    2025: {
+        1: 0.027511,
+        2: 0.012376,
+        3: 0.004943,
+        4: 0.002627,
+        5: 0.000111,
+        6: 0.000031,
+    },
     2026: {
         1: 0.007379,
         2: 0.003798,
@@ -21,8 +29,16 @@ PEAJES_ENERGIA_30TD = {
     },
 }
 
-# Cargos de energía 3.0TD (€/kWh) — Orden TED/1524/2025, segmento 2
+# Cargos de energía 3.0TD (€/kWh)
 CARGOS_ENERGIA_30TD = {
+    2025: {
+        1: 0.035841,
+        2: 0.026538,
+        3: 0.014336,
+        4: 0.007168,
+        5: 0.004595,
+        6: 0.002867,
+    },
     2026: {
         1: 0.035841,
         2: 0.026538,
@@ -36,6 +52,8 @@ CARGOS_ENERGIA_30TD = {
 
 def tarifa_acceso_energia(anio, periodo):
     """(peaje + cargo) en €/kWh para un año y periodo 3.0TD."""
+    if anio not in PEAJES_ENERGIA_30TD:
+        raise ValueError(f"Sin peajes para el año {anio}. Añádelos en teta_regulado.py")
     return PEAJES_ENERGIA_30TD[anio][periodo] + CARGOS_ENERGIA_30TD[anio][periodo]
 
 
