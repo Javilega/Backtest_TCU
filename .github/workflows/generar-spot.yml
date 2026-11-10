@@ -1,0 +1,32 @@
+name: Generar Spot Mensual
+
+on:
+  workflow_dispatch: # Esto permite ejecutarlo manualmente desde la pestaña Actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout del repositorio
+      uses: actions/checkout@v4
+
+    - name: Configurar Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Instalar dependencias
+      run: |
+        pip install requests python-dotenv holidays
+
+    - name: Ejecutar script para generar CSV
+      env:
+        ESIOS_TOKEN: ${{ secrets.ESIOS_TOKEN }}
+      run: python generar_spot_mensual.py
+
+    - name: Subir el archivo CSV como artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: spot-mensual
+        path: spot_mensual.csv
