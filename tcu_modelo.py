@@ -1,4 +1,4 @@
-"""Estimación del coste de la energía 3.0TD con tolerancia a fallos de ESIOS."""
+"""Estimación del coste de la energía 3.0TD con imputación de datos faltantes."""
 from dotenv import load_dotenv
 load_dotenv()
 import statistics, datetime as dt
@@ -43,7 +43,7 @@ def precio_hora_30td(t_utc, tcu, incluye_perdidas, fee=0.0, mes_calendario=None,
     return energia + PEAJES[p3] + CARGOS[p3], p3
 
 def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodos=None,
-                           pesos=None, mes_calendario=None, solo_energia=False):
+                           pesos=None, mes_calendario=None, solo_energia=False, historico=None):
     horas = {p: [] for p in range(1, 7)}
     for t, v in tcu:
         if ini <= t < fin:
@@ -65,22 +65,32 @@ def precio_medio_ponderado(tcu, ini, fin, incluye_perdidas, fee=0.0, kwh_periodo
     periodos_ignorados = []
     
     for p, w in pesos_p.items():
-        # FALLBACK: Si un periodo no tiene suficientes horas (ej. ESIOS falló), lo ignoramos
         if len(horas[p]) < 24:
-            periodos_ignorados.append((p, len(horas[p])))
-            continue
+            # IMPUTACIÓN: Buscar en el histórico los últimos 3 meses con datos para este periodo
+            imputado = False
+            if historico:
+                for mes_ant in reversed(historico[-3:]):
+                    if p in mes_ant["detalle"] and mes_ant["detalle"][p][0] >= 24:
+                        media_imputada = mes_ant["detalle"][p][1]
+                        detalle[p] = (0, media_imputada, w) # 0 horas, pero usamos la media imputada
+                        total += w * media_imputada
+                        suma += w
+                        imputado = True
+                        break
+            if not imputado:
+                periodos_ignorados.append((p, len(horas[p])))
+                continue
+        else:
+            media = sum(horas[p]) / len(horas[p])
+            detalle[p] = (len(horas[p]), media, w)
+            total += w * media
+            suma += w
             
-        media = sum(horas[p]) / len(horas[p])
-        detalle[p] = (len(horas[p]), media, w)
-        total += w * media
-        suma += w
-        
     if suma == 0:
-        raise ValueError(f"No hay datos válidos para ningún periodo. Ignorados: {periodos_ignorados}")
+        raise ValueError(f"No hay datos válidos para ningún periodo.")
         
-    # Imprimimos un aviso si hemos ignorado algún periodo, para que quede constancia
     if periodos_ignorados:
-        print(f"AVISO: Periodos ignorados por falta de datos: {periodos_ignorados}. Se recalcula la ponderación con el resto.")
+        print(f"AVISO: Periodos ignorados sin histórico para imputar: {periodos_ignorados}")
 
     return total / suma, detalle, nivel
 
@@ -156,4 +166,4 @@ def metricas(meses, fee, columna_real="coste_energia_real"):
         "desv_tipica": statistics.stdev(err) if len(err) > 1 else 0.0,
         "por_mes_pct": pct,
         "error_euros": [e * w for e, w in zip(err, kwh)],
-        }
+    }
