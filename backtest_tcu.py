@@ -126,4 +126,107 @@ def evaluar_indicador(nombre, id_esios, facturas, datos_indicador, pvpc_referenc
 
     salida(f"\nCRITERIO RELAJADO para {nombre} (MAPE<=8%, |sesgo|<=5%, peor<=15%):")
     salida(f"  sin fee     -> MAPE {r_sin['mape']:.2f} %, sesgo {r_sin['sesgo_pct']:+.2f} %, peor {peor_sin:.1f} % => {'APTO' if ok_sin else 'NO APTO'}")
-    salida(f"  fee aditivo -> MAPE {r_adit['mape']:.2f} %, sesgo {r_adit['sesgo_pct']:+.2f} %, peor {peor_adit:.1f} % => {'APTO' if ok_adit else 'NO AP
+    salida(f"  fee aditivo -> MAPE {r_adit['mape']:.2f} %, sesgo {r_adit['sesgo_pct']:+.2f} %, peor {peor_adit:.1f} % => {'APTO' if ok_adit else 'NO APTO'}")
+    salida(f"  fee bloques -> MAPE {r_bloq['mape']:.2f} %, sesgo {r_bloq['sesgo_pct']:+.2f} %, peor {peor_bloq:.1f} % => {'APTO' if ok_bloq else 'NO APTO'}")
+
+    candidatos = {"sin fee": r_sin["mape"], "fee aditivo": r_adit["mape"], "fee bloques": r_bloq["mape"]}
+    mejor = min(candidatos, key=candidatos.get)
+    salida(f"  MODELO RECOMENDADO: {mejor} (MAPE {candidatos[mejor]:.2f} %)")
+
+    return {"fee_aditivo": fee_aditivo, "fee_bloques": fee_bloques,
+            "mejor": mejor, "incluye": incluye}
+
+
+def walk_forward(facturas, datos_indicador, incluye, min_train=6):
+    """Walk-forward: entrena con [0..t-1], predice t. Sin leakage.
+
+    Calcula precio_modelo_sin_fee para TODOS los meses antes de calibrar,
+    evitando el KeyError de la versión anterior.
+    """
+    meses = []
+    for f in facturas:
+        ini, fin, mes = limites_mes(f["mes"])
+        precio, _, nivel = m.precio_medio_ponderado(
+            datos_indicador, ini, fin, incluye, 0.0,
+            kwh_periodos=f["kwh_p"],
+            pesos=u.PESOS_PERIODOS[mes], mes_calendario=mes)
+        meses.append({**f, "precio_modelo_sin_fee": precio, "nivel": nivel})
+
+    resultados = []
+    for t in range(min_train, len(meses)):
+        train = [x for x in meses[:t]
+                 if x["kwh"] > 0 and x["kwh_p"] and x["mes"] != "2026-04"]
+        if len(train) < 3:
+            continue
+        test = meses[t]
+        fee_adit = m.calibrar_fee(train)
+        ini, fin, mes = limites_mes(test["mes"])
+        pred_adit, _, _ = m.precio_medio_ponderado(
+            datos_indicador, ini, fin, incluye, fee_adit,
+            kwh_periodos=test["kwh_p"],
+            pesos=u.PESOS_PERIODOS[mes], mes_calendario=mes)
+        pred_sin = test["precio_modelo_sin_fee"]
+        resultados.append({
+            "mes": test["mes"], "real": test["precio_real"],
+            "pred_adit": pred_adit, "pred_sin": pred_sin,
+            "pct_adit": 100 * (pred_adit / test["precio_real"] - 1),
+            "pct_sin": 100 * (pred_sin / test["precio_real"] - 1),
+        })
+    return resultados
+
+
+def reporte_walk_forward(resultados, nombre):
+    import statistics as st
+    if not resultados:
+        print(f"\nWALK-FORWARD {nombre}: sin meses suficientes")
+        return
+    pcts_a = [r["pct_adit"] for r in resultados]
+    pcts_s = [r["pct_sin"] for r in resultados]
+    print(f"\nWALK-FORWARD {nombre}: {len(resultados)} meses out-of-sample")
+    print("Mes      | real    | pred adit | desv adit | pred sin | desv sin")
+    for r in resultados:
+        print(f"{r['mes']} | {r['real']:.4f} | {r['pred_adit']:.4f} | {r['pct_adit']:+7.1f} % | "
+              f"{r['pred_sin']:.4f} | {r['pct_sin']:+7.1f} %")
+    print(f"  fee aditivo -> MAPE {st.mean(abs(p) for p in pcts_a):.2f} % | "
+          f"sesgo {st.mean(pcts_a):+.2f} % | peor {max(abs(p) for p in pcts_a):.1f} %")
+    print(f"  sin fee     -> MAPE {st.mean(abs(p) for p in pcts_s):.2f} % | "
+          f"sesgo {st.mean(pcts_s):+.2f} % | peor {max(abs(p) for p in pcts_s):.1f} %")
+
+
+def main(argv):
+    if len(argv) < 2:
+        print(__doc__)
+        return 1
+
+    train_hasta = argv[argv.index("--train-hasta") + 1] if "--train-hasta" in argv else None
+    fee_fijo = float(argv[argv.index("--fee-fijo") + 1]) if "--fee-fijo" in argv else 0.0052
+    facturas = leer_facturas(argv[1])
+
+    ini = limites_mes(facturas[0]["mes"])[0]
+    fin = limites_mes(facturas[-1]["mes"])[1]
+
+    print(f"Descargando datos históricos de ESIOS desde {ini.date()} hasta {fin.date()}...")
+    pvpc_data, spot_data = descargar_ambos_esios(ini, fin)
+
+    evaluar_indicador(
+        nombre="Mercado Diario (SPOT)", id_esios=600, facturas=facturas,
+        datos_indicador=spot_data, pvpc_referencia=pvpc_data,
+        incluye=False, train_hasta=train_hasta, fee_fijo=fee_fijo)
+
+    evaluar_indicador(
+        nombre="TCU PVPC", id_esios=1001, facturas=facturas,
+        datos_indicador=pvpc_data, pvpc_referencia=pvpc_data,
+        incluye=None, train_hasta=train_hasta, fee_fijo=fee_fijo)
+
+    print(f"\n{'='*70}")
+    print(" WALK-FORWARD (sin leakage, 2026-04 excluido del train)")
+    print(f"{'='*70}")
+    for nombre, datos, incluye in (("SPOT", spot_data, False), ("PVPC", pvpc_data, False)):
+        wf = walk_forward(facturas, datos, incluye)
+        reporte_walk_forward(wf, nombre)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
