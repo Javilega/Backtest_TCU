@@ -1,0 +1,40 @@
+name: Coste Energía
+
+on:
+  workflow_dispatch:  # Ejecución manual desde la pestaña Actions
+
+jobs:
+  calcular-coste:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout del repositorio
+      uses: actions/checkout@v4
+
+    - name: Configurar Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Instalar dependencias
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Generar spot_mensual.csv
+      env:
+        ESIOS_TOKEN: ${{ secrets.ESIOS_TOKEN }}
+      run: python generar_spot_mensual.py
+
+    - name: Ejecutar coste_energia.py
+      env:
+        ESIOS_TOKEN: ${{ secrets.ESIOS_TOKEN }}
+      run: python coste_energia.py facturas_desglosadas.csv spot_mensual.csv
+
+    - name: Subir resultados como artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: coste-energia-resultado
+        path: |
+          coste_energia_resultado.csv
+          spot_mensual.csv
